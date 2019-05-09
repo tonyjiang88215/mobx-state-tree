@@ -1,100 +1,143 @@
 import {
     fail,
-    INode,
-    Type,
-    IType,
-    IContext,
+    BaseType,
+    IValidationContext,
     IValidationResult,
     TypeFlags,
-    isType
+    isType,
+    IAnyType,
+    typeCheckSuccess,
+    AnyObjectNode,
+    ExtractNodeType,
+    cannotDetermineSubtype,
+    devMode
 } from "../../internal"
 
-export class Late<S, T> extends Type<S, T> {
-    readonly definition: () => IType<S, T>
-    private _subType: IType<S, T> | null = null
+class Late<IT extends IAnyType> extends BaseType<
+    IT["CreationType"],
+    IT["SnapshotType"],
+    IT["TypeWithoutSTN"],
+    ExtractNodeType<IT>
+> {
+    private _subType?: IT
 
     get flags() {
-        return this.subType.flags | TypeFlags.Late
+        return (this._subType ? this._subType.flags : 0) | TypeFlags.Late
     }
 
-    get shouldAttachNode() {
-        return this.subType.shouldAttachNode
-    }
-
-    get subType(): IType<S, T> {
-        if (this._subType === null) {
-            this._subType = this.definition()
+    getSubType(mustSucceed: true): IT
+    getSubType(mustSucceed: false): IT | undefined
+    getSubType(mustSucceed: boolean): IT | undefined {
+        if (!this._subType) {
+            let t = undefined
+            try {
+                t = this._definition()
+            } catch (e) {
+                if (e instanceof ReferenceError)
+                    // can happen in strict ES5 code when a definition is self refering
+                    t = undefined
+                else throw e
+            }
+            if (mustSucceed && t === undefined)
+                throw fail(
+                    "Late type seems to be used too early, the definition (still) returns undefined"
+                )
+            if (t) {
+                if (devMode() && !isType(t))
+                    throw fail(
+                        "Failed to determine subtype, make sure types.late returns a type definition."
+                    )
+                this._subType = t
+            }
         }
         return this._subType
     }
 
-    constructor(name: string, definition: () => IType<S, T>) {
+    constructor(name: string, private readonly _definition: () => IT) {
         super(name)
-        this.definition = definition
     }
 
-    instantiate(parent: INode | null, subpath: string, environment: any, snapshot: any): INode {
-        return this.subType.instantiate(parent, subpath, environment, snapshot)
+    instantiate(
+        parent: AnyObjectNode | null,
+        subpath: string,
+        environment: any,
+        initialValue: this["C"] | this["T"]
+    ): this["N"] {
+        return this.getSubType(true).instantiate(parent, subpath, environment, initialValue)
     }
 
-    reconcile(current: INode, newValue: any): INode {
-        return this.subType.reconcile(current, newValue)
+    reconcile(
+        current: this["N"],
+        newValue: this["C"] | this["T"],
+        parent: AnyObjectNode,
+        subpath: string
+    ): this["N"] {
+        return this.getSubType(true).reconcile(current, newValue, parent, subpath)
     }
 
     describe() {
-        return this.subType.name
+        const t = this.getSubType(false)
+        return t ? t.name : "<uknown late type>"
     }
 
-    isValidSnapshot(value: any, context: IContext): IValidationResult {
-        return this.subType.validate(value, context)
+    isValidSnapshot(value: this["C"], context: IValidationContext): IValidationResult {
+        const t = this.getSubType(false)
+        if (!t) {
+            // See #916; the variable the definition closure is pointing to wasn't defined yet, so can't be evaluted yet here
+            return typeCheckSuccess()
+        }
+        return t.validate(value, context)
     }
 
-    isAssignableFrom(type: IType<any, any>) {
-        return this.subType.isAssignableFrom(type)
+    isAssignableFrom(type: IAnyType) {
+        const t = this.getSubType(false)
+        return t ? t.isAssignableFrom(type) : false
+    }
+
+    getSubTypes() {
+        const subtype = this.getSubType(false)
+        return subtype ? subtype : cannotDetermineSubtype
     }
 }
 
-export type ILateType<S, T> = () => IType<S, T>
-
-export function late<S = any, T = any>(type: ILateType<S, T>): IType<S, T>
-export function late<S = any, T = any>(name: string, type: ILateType<S, T>): IType<S, T>
+export function late<T extends IAnyType>(type: () => T): T
+export function late<T extends IAnyType>(name: string, type: () => T): T
 /**
- * Defines a type that gets implemented later. This is useful when you have to deal with circular dependencies.
+ * `types.late` - Defines a type that gets implemented later. This is useful when you have to deal with circular dependencies.
  * Please notice that when defining circular dependencies TypeScript isn't smart enough to inference them.
- * You need to declare an interface to explicit the return type of the late parameter function.
  *
- * @example
- *  interface INode {
- *       childs: INode[]
- *  }
- *
- *   // TypeScript is'nt smart enough to infer self referencing types.
+ * Example:
+ * ```ts
+ *   // TypeScript isn't smart enough to infer self referencing types.
  *  const Node = types.model({
- *       childs: types.optional(types.array(types.late<any, INode>(() => Node)), [])
+ *       children: types.array(types.late((): IAnyModelType => Node)) // then typecast each array element to Instance<typeof Node>
  *  })
+ * ```
  *
- * @export
- * @alias types.late
- * @template S
- * @template T
- * @param {string} [name] The name to use for the type that will be returned.
- * @param {ILateType<S, T>} type A function that returns the type that will be defined.
- * @returns {IType<S, T>}
+ * @param name The name to use for the type that will be returned.
+ * @param type A function that returns the type that will be defined.
+ * @returns
  */
-export function late<S, T>(nameOrType: any, maybeType?: ILateType<S, T>): IType<S, T> {
+export function late(nameOrType: any, maybeType?: () => IAnyType): IAnyType {
     const name = typeof nameOrType === "string" ? nameOrType : `late(${nameOrType.toString()})`
     const type = typeof nameOrType === "string" ? maybeType : nameOrType
     // checks that the type is actually a late type
-    if (process.env.NODE_ENV !== "production") {
+    if (devMode()) {
         if (!(typeof type === "function" && type.length === 0))
-            fail(
+            throw fail(
                 "Invalid late type, expected a function with zero arguments that returns a type, got: " +
                     type
             )
     }
-    return new Late<S, T>(name, type)
+    return new Late(name, type)
 }
 
-export function isLateType(type: any): type is Late<any, any> {
+/**
+ * Returns if a given value represents a late type.
+ *
+ * @param type
+ * @returns
+ */
+export function isLateType<IT extends IAnyType>(type: IT): type is IT {
     return isType(type) && (type.flags & TypeFlags.Late) > 0
 }

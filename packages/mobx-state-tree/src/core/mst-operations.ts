@@ -1,32 +1,75 @@
-import { IObservableArray, ObservableMap } from "mobx"
+import { isComputedProp, isObservableProp } from "mobx"
+import {
+    IAnyStateTreeNode,
+    IType,
+    IAnyModelType,
+    getStateTreeNode,
+    IStateTreeNode,
+    isStateTreeNode,
+    IJsonPatch,
+    splitJsonPath,
+    asArray,
+    EMPTY_OBJECT,
+    fail,
+    IDisposer,
+    resolveNodeByPath,
+    getRelativePathBetweenNodes,
+    freeze,
+    IAnyType,
+    isModelType,
+    InvalidReferenceError,
+    normalizeIdentifier,
+    ReferenceIdentifier,
+    AnyObjectNode,
+    assertIsType,
+    assertIsStateTreeNode,
+    TypeOfValue,
+    assertIsFunction,
+    assertIsNumber,
+    assertIsString,
+    assertArg,
+    assertIsValidIdentifier,
+    IActionContext,
+    getRunningActionContext
+} from "../internal"
+
+/** @hidden */
+export type TypeOrStateTreeNodeToStateTreeNode<
+    T extends IAnyType | IAnyStateTreeNode
+> = T extends IType<any, any, infer TT> ? TT & IStateTreeNode<T> : T
 
 /**
  * Returns the _actual_ type of the given tree node. (Or throws)
  *
- * @export
- * @param {IStateTreeNode} object
- * @returns {IType<S, T>}
+ * @param object
+ * @returns
  */
-export function getType<S, T>(object: IStateTreeNode): IType<S, T> {
+export function getType(object: IAnyStateTreeNode): IAnyType {
+    assertIsStateTreeNode(object, 1)
+
     return getStateTreeNode(object).type
 }
 
 /**
  * Returns the _declared_ type of the given sub property of an object, array or map.
+ * In the case of arrays and maps the property name is optional and will be ignored.
  *
- * @example
+ * Example:
+ * ```ts
  * const Box = types.model({ x: 0, y: 0 })
  * const box = Box.create()
  *
  * console.log(getChildType(box, "x").name) // 'number'
+ * ```
  *
- * @export
- * @param {IStateTreeNode} object
- * @param {string} child
- * @returns {IType<any, any>}
+ * @param object
+ * @param propertyName
+ * @returns
  */
-export function getChildType(object: IStateTreeNode, child: string): IType<any, any> {
-    return getStateTreeNode(object).getChildType(child)
+export function getChildType(object: IAnyStateTreeNode, propertyName?: string): IAnyType {
+    assertIsStateTreeNode(object, 1)
+
+    return getStateTreeNode(object).getChildType(propertyName)
 }
 
 /**
@@ -34,56 +77,38 @@ export function getChildType(object: IStateTreeNode, child: string): IType<any, 
  * See [patches](https://github.com/mobxjs/mobx-state-tree#patches) for more details. onPatch events are emitted immediately and will not await the end of a transaction.
  * Patches can be used to deep observe a model tree.
  *
- * @export
- * @param {Object} target the model instance from which to receive patches
- * @param {(patch: IJsonPatch, reversePatch) => void} callback the callback that is invoked for each patch. The reversePatch is a patch that would actually undo the emitted patch
- * @param {includeOldValue} boolean if oldValue is included in the patches, they can be inverted. However patches will become much bigger and might not be suitable for efficient transport
- * @returns {IDisposer} function to remove the listener
+ * @param target the model instance from which to receive patches
+ * @param callback the callback that is invoked for each patch. The reversePatch is a patch that would actually undo the emitted patch
+ * @returns function to remove the listener
  */
 export function onPatch(
-    target: IStateTreeNode,
+    target: IAnyStateTreeNode,
     callback: (patch: IJsonPatch, reversePatch: IJsonPatch) => void
 ): IDisposer {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof callback !== "function")
-            fail("expected second argument to be a function, got " + callback + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+    assertIsFunction(callback, 2)
+
     return getStateTreeNode(target).onPatch(callback)
 }
 
-export function onSnapshot<S>(
-    target: ObservableMap<S>,
-    callback: (snapshot: { [key: string]: S }) => void
-): IDisposer
-export function onSnapshot<S>(
-    target: IObservableArray<S>,
-    callback: (snapshot: S[]) => void
-): IDisposer
-export function onSnapshot<S>(target: ISnapshottable<S>, callback: (snapshot: S) => void): IDisposer
 /**
  * Registers a function that is invoked whenever a new snapshot for the given model instance is available.
- * The listener will only be fire at the and of the current MobX (trans)action.
+ * The listener will only be fire at the end of the current MobX (trans)action.
  * See [snapshots](https://github.com/mobxjs/mobx-state-tree#snapshots) for more details.
  *
- * @export
- * @param {Object} target
- * @param {(snapshot: any) => void} callback
- * @returns {IDisposer}
+ * @param target
+ * @param callback
+ * @returns
  */
 export function onSnapshot<S>(
-    target: ISnapshottable<S>,
+    target: IStateTreeNode<IType<any, S, any>>,
     callback: (snapshot: S) => void
 ): IDisposer {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof callback !== "function")
-            fail("expected second argument to be a function, got " + callback + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+    assertIsFunction(callback, 2)
+
     return getStateTreeNode(target).onSnapshot(callback)
 }
 
@@ -93,111 +118,157 @@ export function onSnapshot<S>(
  *
  * Can apply a single past, or an array of patches.
  *
- * @export
- * @param {Object} target
- * @param {IJsonPatch} patch
+ * @param target
+ * @param patch
  * @returns
  */
-export function applyPatch(target: IStateTreeNode, patch: IJsonPatch | IJsonPatch[]) {
+export function applyPatch(
+    target: IAnyStateTreeNode,
+    patch: IJsonPatch | ReadonlyArray<IJsonPatch>
+): void {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof patch !== "object")
-            fail("expected second argument to be an object or array, got " + patch + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+    assertArg(patch, p => typeof p === "object", "object or array", 2)
+
     getStateTreeNode(target).applyPatches(asArray(patch))
 }
 
 export interface IPatchRecorder {
     patches: ReadonlyArray<IJsonPatch>
     inversePatches: ReadonlyArray<IJsonPatch>
-    stop(): any
-    replay(target?: IStateTreeNode): any
-    undo(target?: IStateTreeNode): void
+    reversedInversePatches: ReadonlyArray<IJsonPatch>
+    readonly recording: boolean
+    stop(): void
+    resume(): void
+    replay(target?: IAnyStateTreeNode): void
+    undo(target?: IAnyStateTreeNode): void
 }
 
 /**
  * Small abstraction around `onPatch` and `applyPatch`, attaches a patch listener to a tree and records all the patches.
  * Returns an recorder object with the following signature:
  *
- * @example
+ * Example:
+ * ```ts
  * export interface IPatchRecorder {
  *      // the recorded patches
  *      patches: IJsonPatch[]
  *      // the inverse of the recorded patches
  *      inversePatches: IJsonPatch[]
+ *      // true if currently recording
+ *      recording: boolean
  *      // stop recording patches
- *      stop(target?: IStateTreeNode): any
+ *      stop(): void
  *      // resume recording patches
- *      resume()
+ *      resume(): void
  *      // apply all the recorded patches on the given target (the original subject if omitted)
- *      replay(target?: IStateTreeNode): any
+ *      replay(target?: IAnyStateTreeNode): void
  *      // reverse apply the recorded patches on the given target  (the original subject if omitted)
  *      // stops the recorder if not already stopped
  *      undo(): void
  * }
+ * ```
  *
- * @export
- * @param {IStateTreeNode} subject
- * @returns {IPatchRecorder}
+ * The optional filter function allows to skip recording certain patches.
+ *
+ * @param subject
+ * @param filter
+ * @returns
  */
-export function recordPatches(subject: IStateTreeNode): IPatchRecorder {
+export function recordPatches(
+    subject: IAnyStateTreeNode,
+    filter?: (
+        patch: IJsonPatch,
+        inversePatch: IJsonPatch,
+        actionContext: IActionContext | undefined
+    ) => boolean
+): IPatchRecorder {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(subject))
-            fail(
-                "expected first argument to be a mobx-state-tree node, got " + subject + " instead"
-            )
+    assertIsStateTreeNode(subject, 1)
+
+    interface IPatches {
+        patches: IJsonPatch[]
+        reversedInversePatches: IJsonPatch[]
+        inversePatches: IJsonPatch[]
     }
 
-    let disposer: IDisposer | null = null
-    function resume() {
-        if (disposer) return
-        disposer = onPatch(subject, (patch, inversePatch) => {
-            recorder.rawPatches.push([patch, inversePatch])
-        })
+    const data: Pick<IPatches, "patches" | "reversedInversePatches"> = {
+        patches: [],
+        reversedInversePatches: []
     }
 
-    let recorder = {
-        rawPatches: [] as [IJsonPatch, IJsonPatch][],
+    // we will generate the immutable copy of patches on demand for public consumption
+    const publicData: Partial<IPatches> = {}
+
+    let disposer: IDisposer | undefined
+
+    const recorder: IPatchRecorder = {
+        get recording() {
+            return !!disposer
+        },
         get patches() {
-            return this.rawPatches.map(([a]) => a)
+            if (!publicData.patches) {
+                publicData.patches = data.patches.slice()
+            }
+            return publicData.patches
+        },
+        get reversedInversePatches() {
+            if (!publicData.reversedInversePatches) {
+                publicData.reversedInversePatches = data.reversedInversePatches.slice()
+            }
+            return publicData.reversedInversePatches
         },
         get inversePatches() {
-            return this.rawPatches.map(([_, b]) => b)
+            if (!publicData.inversePatches) {
+                publicData.inversePatches = data.reversedInversePatches.slice().reverse()
+            }
+            return publicData.inversePatches
         },
         stop() {
-            if (disposer) disposer()
-            disposer = null
+            if (disposer) {
+                disposer()
+                disposer = undefined
+            }
         },
-        resume,
-        replay(target?: IStateTreeNode) {
-            applyPatch(target || subject, recorder.patches)
+        resume() {
+            if (disposer) return
+            disposer = onPatch(subject, (patch, inversePatch) => {
+                // skip patches that are asked to be filtered if there's a filter in place
+                if (filter && !filter(patch, inversePatch, getRunningActionContext())) {
+                    return
+                }
+                data.patches.push(patch)
+                data.reversedInversePatches.unshift(inversePatch)
+
+                // mark immutable public patches as dirty
+                publicData.patches = undefined
+                publicData.inversePatches = undefined
+                publicData.reversedInversePatches = undefined
+            })
         },
-        undo(target?: IStateTreeNode) {
-            applyPatch(target || subject, recorder.inversePatches.slice().reverse())
+        replay(target?: IAnyStateTreeNode) {
+            applyPatch(target || subject, data.patches)
+        },
+        undo(target?: IAnyStateTreeNode) {
+            applyPatch(target || subject, data.reversedInversePatches)
         }
     }
-    resume()
+
+    recorder.resume()
     return recorder
 }
 
 /**
- * The inverse of `unprotect`
+ * The inverse of `unprotect`.
  *
- * @export
- * @param {IStateTreeNode} target
- *
+ * @param target
  */
-export function protect(target: IStateTreeNode) {
+export function protect(target: IAnyStateTreeNode): void {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     const node = getStateTreeNode(target)
-    if (!node.isRoot) fail("`protect` can only be invoked on root nodes")
+    if (!node.isRoot) throw fail("`protect` can only be invoked on root nodes")
     node.isProtectionEnabled = true
 }
 
@@ -208,7 +279,8 @@ export function protect(target: IStateTreeNode) {
  *
  * In that case you can disable this protection by calling `unprotect` on the root of your tree.
  *
- * @example
+ * Example:
+ * ```ts
  * const Todo = types.model({
  *     done: false
  * }).actions(self => ({
@@ -222,80 +294,72 @@ export function protect(target: IStateTreeNode) {
  * todo.toggle() // OK
  * unprotect(todo)
  * todo.done = false // OK
+ * ```
  */
-export function unprotect(target: IStateTreeNode) {
+export function unprotect(target: IAnyStateTreeNode): void {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     const node = getStateTreeNode(target)
-    if (!node.isRoot) fail("`unprotect` can only be invoked on root nodes")
+    if (!node.isRoot) throw fail("`unprotect` can only be invoked on root nodes")
     node.isProtectionEnabled = false
 }
 
 /**
  * Returns true if the object is in protected mode, @see protect
  */
-export function isProtected(target: IStateTreeNode): boolean {
+export function isProtected(target: IAnyStateTreeNode): boolean {
     return getStateTreeNode(target).isProtected
 }
 
 /**
  * Applies a snapshot to a given model instances. Patch and snapshot listeners will be invoked as usual.
  *
- * @export
- * @param {Object} target
- * @param {Object} snapshot
+ * @param target
+ * @param snapshot
  * @returns
  */
-export function applySnapshot<S, T>(target: IStateTreeNode, snapshot: S) {
+export function applySnapshot<C>(target: IStateTreeNode<IType<C, any, any>>, snapshot: C) {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     return getStateTreeNode(target).applySnapshot(snapshot)
 }
 
-export function getSnapshot<S>(target: ObservableMap<S>): { [key: string]: S }
-export function getSnapshot<S>(target: IObservableArray<S>): S[]
-export function getSnapshot<S>(target: ISnapshottable<S>): S
 /**
  * Calculates a snapshot from the given model instance. The snapshot will always reflect the latest state but use
  * structural sharing where possible. Doesn't require MobX transactions to be completed.
  *
- * @export
- * @param {Object} target
- * @returns {*}
+ * @param target
+ * @param applyPostProcess If true (the default) then postProcessSnapshot gets applied.
+ * @returns
  */
-export function getSnapshot<S>(target: ISnapshottable<S>): S {
+export function getSnapshot<S>(
+    target: IStateTreeNode<IType<any, S, any>>,
+    applyPostProcess = true
+): S {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
-    return getStateTreeNode(target).snapshot
+    assertIsStateTreeNode(target, 1)
+
+    const node = getStateTreeNode(target)
+    if (applyPostProcess) return node.snapshot
+
+    return freeze(node.type.getSnapshot(node, false))
 }
 
 /**
- * Given a model instance, returns `true` if the object has a parent, that is, is part of another object, map or array
+ * Given a model instance, returns `true` if the object has a parent, that is, is part of another object, map or array.
  *
- * @export
- * @param {Object} target
- * @param {number} depth = 1, how far should we look upward?
- * @returns {boolean}
+ * @param target
+ * @param depth How far should we look upward? 1 by default.
+ * @returns
  */
-export function hasParent(target: IStateTreeNode, depth: number = 1): boolean {
+export function hasParent(target: IAnyStateTreeNode, depth: number = 1): boolean {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof depth !== "number")
-            fail("expected second argument to be a number, got " + depth + " instead")
-        if (depth < 0) fail(`Invalid depth: ${depth}, should be >= 1`)
-    }
-    let parent: INode | null = getStateTreeNode(target).parent
+    assertIsStateTreeNode(target, 1)
+    assertIsNumber(depth, 2, 0)
+
+    let parent: AnyObjectNode | null = getStateTreeNode(target).parent
     while (parent) {
         if (--depth === 0) return true
         parent = parent.parent
@@ -303,100 +367,133 @@ export function hasParent(target: IStateTreeNode, depth: number = 1): boolean {
     return false
 }
 
-export function getParent(target: IStateTreeNode, depth?: number): any & IStateTreeNode
-export function getParent<T>(target: IStateTreeNode, depth?: number): T & IStateTreeNode
 /**
- * Returns the immediate parent of this object, or null.
+ * Returns the immediate parent of this object, or throws.
  *
  * Note that the immediate parent can be either an object, map or array, and
- * doesn't necessarily refer to the parent model
+ * doesn't necessarily refer to the parent model.
  *
- * @export
- * @param {Object} target
- * @param {number} depth = 1, how far should we look upward?
- * @returns {*}
+ * Please note that in child nodes access to the root is only possible
+ * once the `afterAttach` hook has fired.
+ *
+ * @param target
+ * @param depth How far should we look upward? 1 by default.
+ * @returns
  */
-export function getParent<T>(target: IStateTreeNode, depth = 1): T & IStateTreeNode {
+export function getParent<IT extends IAnyStateTreeNode | IAnyType>(
+    target: IAnyStateTreeNode,
+    depth = 1
+): TypeOrStateTreeNodeToStateTreeNode<IT> {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof depth !== "number")
-            fail("expected second argument to be a number, got " + depth + " instead")
-        if (depth < 0) fail(`Invalid depth: ${depth}, should be >= 1`)
-    }
+    assertIsStateTreeNode(target, 1)
+    assertIsNumber(depth, 2, 0)
+
     let d = depth
-    let parent: INode | null = getStateTreeNode(target).parent
+    let parent: AnyObjectNode | null = getStateTreeNode(target).parent
     while (parent) {
-        if (--d === 0) return parent.storedValue
+        if (--d === 0) return parent.storedValue as any
         parent = parent.parent
     }
-    return fail(`Failed to find the parent of ${getStateTreeNode(target)} at depth ${depth}`)
+    throw fail(`Failed to find the parent of ${getStateTreeNode(target)} at depth ${depth}`)
 }
 
-export function getRoot(target: IStateTreeNode): any & IStateTreeNode
-export function getRoot<T>(target: IStateTreeNode): T & IStateTreeNode
 /**
- * Given an object in a model tree, returns the root object of that tree
+ * Given a model instance, returns `true` if the object has a parent of given type, that is, is part of another object, map or array
  *
- * @export
- * @param {Object} target
- * @returns {*}
+ * @param target
+ * @param type
+ * @returns
  */
-export function getRoot(target: IStateTreeNode): IStateTreeNode {
+export function hasParentOfType(target: IAnyStateTreeNode, type: IAnyType): boolean {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
+    assertIsStateTreeNode(target, 1)
+    assertIsType(type, 2)
+
+    let parent: AnyObjectNode | null = getStateTreeNode(target).parent
+    while (parent) {
+        if (type.is(parent.storedValue)) return true
+        parent = parent.parent
     }
+    return false
+}
+
+/**
+ * Returns the target's parent of a given type, or throws.
+ *
+ * @param target
+ * @param type
+ * @returns
+ */
+export function getParentOfType<IT extends IAnyType>(
+    target: IAnyStateTreeNode,
+    type: IT
+): IT["Type"] {
+    // check all arguments
+    assertIsStateTreeNode(target, 1)
+    assertIsType(type, 2)
+
+    let parent: AnyObjectNode | null = getStateTreeNode(target).parent
+    while (parent) {
+        if (type.is(parent.storedValue)) return parent.storedValue
+        parent = parent.parent
+    }
+    throw fail(`Failed to find the parent of ${getStateTreeNode(target)} of a given type`)
+}
+
+/**
+ * Given an object in a model tree, returns the root object of that tree.
+ *
+ * Please note that in child nodes access to the root is only possible
+ * once the `afterAttach` hook has fired.
+ *
+ * @param target
+ * @returns
+ */
+export function getRoot<IT extends IAnyType | IAnyStateTreeNode>(
+    target: IAnyStateTreeNode
+): TypeOrStateTreeNodeToStateTreeNode<IT> {
+    // check all arguments
+    assertIsStateTreeNode(target, 1)
+
     return getStateTreeNode(target).root.storedValue
 }
 
 /**
  * Returns the path of the given object in the model tree
  *
- * @export
- * @param {Object} target
- * @returns {string}
+ * @param target
+ * @returns
  */
-export function getPath(target: IStateTreeNode): string {
+export function getPath(target: IAnyStateTreeNode): string {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     return getStateTreeNode(target).path
 }
 
 /**
- * Returns the path of the given object as unescaped string array
+ * Returns the path of the given object as unescaped string array.
  *
- * @export
- * @param {Object} target
- * @returns {string[]}
+ * @param target
+ * @returns
  */
-export function getPathParts(target: IStateTreeNode): string[] {
+export function getPathParts(target: IAnyStateTreeNode): string[] {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     return splitJsonPath(getStateTreeNode(target).path)
 }
 
 /**
- * Returns true if the given object is the root of a model tree
+ * Returns true if the given object is the root of a model tree.
  *
- * @export
- * @param {Object} target
- * @returns {boolean}
+ * @param target
+ * @returns
  */
-export function isRoot(target: IStateTreeNode): boolean {
+export function isRoot(target: IAnyStateTreeNode): boolean {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     return getStateTreeNode(target).isRoot
 }
 
@@ -404,19 +501,15 @@ export function isRoot(target: IStateTreeNode): boolean {
  * Resolves a path relatively to a given object.
  * Returns undefined if no value can be found.
  *
- * @export
- * @param {Object} target
- * @param {string} path - escaped json path
- * @returns {*}
+ * @param target
+ * @param path escaped json path
+ * @returns
  */
-export function resolvePath(target: IStateTreeNode, path: string): IStateTreeNode | any {
+export function resolvePath(target: IAnyStateTreeNode, path: string): any {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof path !== "string")
-            fail("expected second argument to be a number, got " + path + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+    assertIsString(path, 2)
+
     const node = resolveNodeByPath(getStateTreeNode(target), path)
     return node ? node.value : undefined
 }
@@ -425,73 +518,139 @@ export function resolvePath(target: IStateTreeNode, path: string): IStateTreeNod
  * Resolves a model instance given a root target, the type and the identifier you are searching for.
  * Returns undefined if no value can be found.
  *
- * @export
- * @param {IType<any, any>} type
- * @param {IStateTreeNode} target
- * @param {(string | number)} identifier
- * @returns {*}
+ * @param type
+ * @param target
+ * @param identifier
+ * @returns
  */
-export function resolveIdentifier(
-    type: IType<any, any>,
-    target: IStateTreeNode,
-    identifier: string | number
-): any {
+export function resolveIdentifier<IT extends IAnyType>(
+    type: IT,
+    target: IAnyStateTreeNode,
+    identifier: ReferenceIdentifier
+): IT["Type"] | undefined {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isType(type))
-            fail("expected first argument to be a mobx-state-tree type, got " + type + " instead")
-        if (!isStateTreeNode(target))
-            fail(
-                "expected second argument to be a mobx-state-tree node, got " + target + " instead"
-            )
-        if (!(typeof identifier === "string" || typeof identifier === "number"))
-            fail("expected third argument to be a string or number, got " + identifier + " instead")
-    }
-    const node = getStateTreeNode(target).root.identifierCache!.resolve(type, "" + identifier)
+    assertIsType(type, 1)
+    assertIsStateTreeNode(target, 2)
+    assertIsValidIdentifier(identifier, 3)
+
+    const node = getStateTreeNode(target).root.identifierCache!.resolve(
+        type,
+        normalizeIdentifier(identifier)
+    )
     return node ? node.value : undefined
 }
 
 /**
+ * Returns the identifier of the target node.
+ * This is the *string normalized* identifier, which might not match the type of the identifier attribute
  *
- *
- * @export
- * @param {Object} target
- * @param {string} path
- * @returns {*}
+ * @param target
+ * @returns
  */
-export function tryResolve(target: IStateTreeNode, path: string): IStateTreeNode | any {
+export function getIdentifier(target: IAnyStateTreeNode): string | null {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof path !== "string")
-            fail("expected second argument to be a string, got " + path + " instead")
+    assertIsStateTreeNode(target, 1)
+
+    return getStateTreeNode(target).identifier
+}
+
+/**
+ * Tests if a reference is valid (pointing to an existing node and optionally if alive) and returns such reference if it the check passes,
+ * else it returns undefined.
+ *
+ * @param getter Function to access the reference.
+ * @param checkIfAlive true to also make sure the referenced node is alive (default), false to skip this check.
+ * @returns
+ */
+export function tryReference<N extends IAnyStateTreeNode>(
+    getter: () => N | null | undefined,
+    checkIfAlive = true
+): N | undefined {
+    try {
+        const node = getter()
+        if (node === undefined || node === null) {
+            return undefined
+        } else if (isStateTreeNode(node)) {
+            if (!checkIfAlive) {
+                return node
+            } else {
+                return isAlive(node) ? node : undefined
+            }
+        } else {
+            throw fail("The reference to be checked is not one of node, null or undefined")
+        }
+    } catch (e) {
+        if (e instanceof InvalidReferenceError) {
+            return undefined
+        }
+        throw e
     }
+}
+
+/**
+ * Tests if a reference is valid (pointing to an existing node and optionally if alive) and returns if the check passes or not.
+ *
+ * @param getter Function to access the reference.
+ * @param checkIfAlive true to also make sure the referenced node is alive (default), false to skip this check.
+ * @returns
+ */
+export function isValidReference<N extends IAnyStateTreeNode>(
+    getter: () => N | null | undefined,
+    checkIfAlive = true
+): boolean {
+    try {
+        const node = getter()
+        if (node === undefined || node === null) {
+            return false
+        } else if (isStateTreeNode(node)) {
+            return checkIfAlive ? isAlive(node) : true
+        } else {
+            throw fail("The reference to be checked is not one of node, null or undefined")
+        }
+    } catch (e) {
+        if (e instanceof InvalidReferenceError) {
+            return false
+        }
+        throw e
+    }
+}
+
+/**
+ * Try to resolve a given path relative to a given node.
+ *
+ * @param target
+ * @param path
+ * @returns
+ */
+export function tryResolve(target: IAnyStateTreeNode, path: string): any {
+    // check all arguments
+    assertIsStateTreeNode(target, 1)
+    assertIsString(path, 2)
+
     const node = resolveNodeByPath(getStateTreeNode(target), path, false)
     if (node === undefined) return undefined
-    return node ? node.value : undefined
+    try {
+        return node.value
+    } catch (e) {
+        // For what ever reason not resolvable (e.g. totally not existing path, or value that cannot be fetched)
+        // see test / issue: 'try resolve doesn't work #686'
+        return undefined
+    }
 }
 
 /**
  * Given two state tree nodes that are part of the same tree,
  * returns the shortest jsonpath needed to navigate from the one to the other
  *
- * @export
- * @param {IStateTreeNode} base
- * @param {IStateTreeNode} target
- * @returns {string}
+ * @param base
+ * @param target
+ * @returns
  */
-export function getRelativePath(base: IStateTreeNode, target: IStateTreeNode): string {
+export function getRelativePath(base: IAnyStateTreeNode, target: IAnyStateTreeNode): string {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail(
-                "expected second argument to be a mobx-state-tree node, got " + target + " instead"
-            )
+    assertIsStateTreeNode(base, 1)
+    assertIsStateTreeNode(target, 2)
 
-        if (!isStateTreeNode(base))
-            fail("expected first argument to be a mobx-state-tree node, got " + base + " instead")
-    }
     return getRelativePathBetweenNodes(getStateTreeNode(base), getStateTreeNode(target))
 }
 
@@ -501,39 +660,35 @@ export function getRelativePath(base: IStateTreeNode, target: IStateTreeNode): s
  *
  * _Tip: clone will create a literal copy, including the same identifiers. To modify identifiers etc during cloning, don't use clone but take a snapshot of the tree, modify it, and create new instance_
  *
- * @export
- * @template T
- * @param {T} source
- * @param {boolean | any} keepEnvironment indicates whether the clone should inherit the same environment (`true`, the default), or not have an environment (`false`). If an object is passed in as second argument, that will act as the environment for the cloned tree.
- * @returns {T}
+ * @param source
+ * @param keepEnvironment indicates whether the clone should inherit the same environment (`true`, the default), or not have an environment (`false`). If an object is passed in as second argument, that will act as the environment for the cloned tree.
+ * @returns
  */
-export function clone<T extends IStateTreeNode>(
+export function clone<T extends IAnyStateTreeNode>(
     source: T,
     keepEnvironment: boolean | any = true
 ): T {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(source))
-            fail("expected first argument to be a mobx-state-tree node, got " + source + " instead")
-    }
+    assertIsStateTreeNode(source, 1)
+
     const node = getStateTreeNode(source)
     return node.type.create(
         node.snapshot,
         keepEnvironment === true
-            ? node.root._environment
-            : keepEnvironment === false ? undefined : keepEnvironment
-    ) as T // it's an object or something else
+            ? node.root.environment
+            : keepEnvironment === false
+            ? undefined
+            : keepEnvironment
+    ) // it's an object or something else
 }
 
 /**
  * Removes a model element from the state tree, and let it live on as a new state tree
  */
-export function detach<T extends IStateTreeNode>(target: T): T {
+export function detach<T extends IAnyStateTreeNode>(target: T): T {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     getStateTreeNode(target).detach()
     return target
 }
@@ -541,12 +696,10 @@ export function detach<T extends IStateTreeNode>(target: T): T {
 /**
  * Removes a model element from the state tree, and mark it as end-of-life; the element should not be used anymore
  */
-export function destroy(target: IStateTreeNode) {
+export function destroy(target: IAnyStateTreeNode): void {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     const node = getStateTreeNode(target)
     if (node.isRoot) node.die()
     else node.parent!.removeChild(node.subpath)
@@ -558,17 +711,14 @@ export function destroy(target: IStateTreeNode) {
  * has not been called. If a node is not alive anymore, the only thing one can do with it
  * is requesting it's last path and snapshot
  *
- * @export
- * @param {IStateTreeNode} target
- * @returns {boolean}
+ * @param target
+ * @returns
  */
-export function isAlive(target: IStateTreeNode): boolean {
+export function isAlive(target: IAnyStateTreeNode): boolean {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
-    return getStateTreeNode(target).isAlive
+    assertIsStateTreeNode(target, 1)
+
+    return getStateTreeNode(target).observableIsAlive
 }
 
 /**
@@ -576,7 +726,10 @@ export function isAlive(target: IStateTreeNode): boolean {
  * targeted state tree node is destroyed. This is a useful alternative to managing
  * cleanup methods yourself using the `beforeDestroy` hook.
  *
- * @example
+ * This methods returns the same disposer that was passed as argument.
+ *
+ * Example:
+ * ```ts
  * const Todo = types.model({
  *   title: types.string
  * }).actions(self => ({
@@ -590,55 +743,55 @@ export function isAlive(target: IStateTreeNode): boolean {
  *     addDisposer(self, autoSaveDisposer)
  *   }
  * }))
+ * ```
  *
- * @export
- * @param {IStateTreeNode} target
- * @param {() => void} disposer
+ * @param target
+ * @param disposer
+ * @returns The same disposer that was passed as argument
  */
-export function addDisposer(target: IStateTreeNode, disposer: () => void) {
+export function addDisposer(target: IAnyStateTreeNode, disposer: IDisposer): IDisposer {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof disposer !== "function")
-            fail("expected second argument to be a function, got " + disposer + " instead")
-    }
-    getStateTreeNode(target).addDisposer(disposer)
+    assertIsStateTreeNode(target, 1)
+    assertIsFunction(disposer, 2)
+
+    const node = getStateTreeNode(target)
+    node.addDisposer(disposer)
+    return disposer
 }
 
 /**
  * Returns the environment of the current state tree. For more info on environments,
  * see [Dependency injection](https://github.com/mobxjs/mobx-state-tree#dependency-injection)
  *
+ * Please note that in child nodes access to the root is only possible
+ * once the `afterAttach` hook has fired
+ *
  * Returns an empty environment if the tree wasn't initialized with an environment
  *
- * @export
- * @param {IStateTreeNode} target
- * @returns {*}
+ * @param target
+ * @returns
  */
-export function getEnv<T = any>(target: IStateTreeNode): T {
+export function getEnv<T = any>(target: IAnyStateTreeNode): T {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+
     const node = getStateTreeNode(target)
-    const env = node.root._environment
-    if (!!!env) return EMPTY_OBJECT as T
+    const env = node.root.environment
+    if (!env) return EMPTY_OBJECT as T
     return env
 }
 
 /**
- * Performs a depth first walk through a tree
+ * Performs a depth first walk through a tree.
  */
-export function walk(target: IStateTreeNode, processor: (item: IStateTreeNode) => void) {
+export function walk(
+    target: IAnyStateTreeNode,
+    processor: (item: IAnyStateTreeNode) => void
+): void {
     // check all arguments
-    if (process.env.NODE_ENV !== "production") {
-        if (!isStateTreeNode(target))
-            fail("expected first argument to be a mobx-state-tree node, got " + target + " instead")
-        if (typeof processor !== "function")
-            fail("expected second argument to be a function, got " + processor + " instead")
-    }
+    assertIsStateTreeNode(target, 1)
+    assertIsFunction(processor, 2)
+
     const node = getStateTreeNode(target)
     // tslint:disable-next-line:no_unused-variable
     node.getChildren().forEach(child => {
@@ -647,20 +800,194 @@ export function walk(target: IStateTreeNode, processor: (item: IStateTreeNode) =
     processor(node.storedValue)
 }
 
-import {
-    INode,
-    getStateTreeNode,
-    IStateTreeNode,
-    isStateTreeNode,
-    IJsonPatch,
-    splitJsonPath,
-    asArray,
-    EMPTY_OBJECT,
-    fail,
-    IDisposer,
-    ISnapshottable,
-    IType,
-    isType,
-    resolveNodeByPath,
-    getRelativePathBetweenNodes
-} from "../internal"
+export interface IModelReflectionPropertiesData {
+    name: string
+    properties: { [K: string]: IAnyType }
+}
+
+/**
+ * Returns a reflection of the model type properties and name for either a model type or model node.
+ *
+ * @param typeOrNode
+ * @returns
+ */
+export function getPropertyMembers(
+    typeOrNode: IAnyModelType | IAnyStateTreeNode
+): IModelReflectionPropertiesData {
+    let type
+
+    if (isStateTreeNode(typeOrNode)) {
+        type = getType(typeOrNode) as IAnyModelType
+    } else {
+        type = typeOrNode
+    }
+
+    assertArg(type, t => isModelType(t), "model type or model instance", 1)
+
+    return {
+        name: type.name,
+        properties: { ...type.properties }
+    }
+}
+
+export interface IModelReflectionData extends IModelReflectionPropertiesData {
+    actions: string[]
+    views: string[]
+    volatile: string[]
+}
+
+/**
+ * Returns a reflection of the model node, including name, properties, views, volatile and actions.
+ *
+ * @param target
+ * @returns
+ */
+export function getMembers(target: IAnyStateTreeNode): IModelReflectionData {
+    const type = (getStateTreeNode(target).type as unknown) as IAnyModelType
+
+    const reflected: IModelReflectionData = {
+        ...getPropertyMembers(type),
+        actions: [],
+        volatile: [],
+        views: []
+    }
+
+    const props = Object.getOwnPropertyNames(target)
+    props.forEach(key => {
+        if (key in reflected.properties) return
+        const descriptor = Object.getOwnPropertyDescriptor(target, key)!
+        if (descriptor.get) {
+            if (isComputedProp(target, key)) reflected.views.push(key)
+            else reflected.volatile.push(key)
+            return
+        }
+        if (descriptor.value._isMSTAction === true) reflected.actions.push(key)
+        else if (isObservableProp(target, key)) reflected.volatile.push(key)
+        else reflected.views.push(key)
+    })
+    return reflected
+}
+
+export function cast<O extends string | number | boolean | null | undefined = never>(
+    snapshotOrInstance: O
+): O
+export function cast<O = never>(
+    snapshotOrInstance:
+        | TypeOfValue<O>["CreationType"]
+        | TypeOfValue<O>["SnapshotType"]
+        | TypeOfValue<O>["Type"]
+): O
+/**
+ * Casts a node snapshot or instance type to an instance type so it can be assigned to a type instance.
+ * Note that this is just a cast for the type system, this is, it won't actually convert a snapshot to an instance,
+ * but just fool typescript into thinking so.
+ * Either way, casting when outside an assignation operation won't compile.
+ *
+ * Example:
+ * ```ts
+ * const ModelA = types.model({
+ *   n: types.number
+ * }).actions(self => ({
+ *   setN(aNumber: number) {
+ *     self.n = aNumber
+ *   }
+ * }))
+ *
+ * const ModelB = types.model({
+ *   innerModel: ModelA
+ * }).actions(self => ({
+ *   someAction() {
+ *     // this will allow the compiler to assign a snapshot to the property
+ *     self.innerModel = cast({ a: 5 })
+ *   }
+ * }))
+ * ```
+ *
+ * @param snapshotOrInstance Snapshot or instance
+ * @returns The same object casted as an instance
+ */
+export function cast(snapshotOrInstance: any): any {
+    return snapshotOrInstance as any
+}
+
+/**
+ * Casts a node instance type to an snapshot type so it can be assigned to a type snapshot (e.g. to be used inside a create call).
+ * Note that this is just a cast for the type system, this is, it won't actually convert an instance to a snapshot,
+ * but just fool typescript into thinking so.
+ *
+ * Example:
+ * ```ts
+ * const ModelA = types.model({
+ *   n: types.number
+ * }).actions(self => ({
+ *   setN(aNumber: number) {
+ *     self.n = aNumber
+ *   }
+ * }))
+ *
+ * const ModelB = types.model({
+ *   innerModel: ModelA
+ * })
+ *
+ * const a = ModelA.create({ n: 5 });
+ * // this will allow the compiler to use a model as if it were a snapshot
+ * const b = ModelB.create({ innerModel: castToSnapshot(a)})
+ * ```
+ *
+ * @param snapshotOrInstance Snapshot or instance
+ * @returns The same object casted as an input (creation) snapshot
+ */
+export function castToSnapshot<I>(
+    snapshotOrInstance: I
+): Extract<I, IAnyStateTreeNode> extends never ? I : TypeOfValue<I>["CreationType"] {
+    return snapshotOrInstance as any
+}
+
+/**
+ * Casts a node instance type to a reference snapshot type so it can be assigned to a refernence snapshot (e.g. to be used inside a create call).
+ * Note that this is just a cast for the type system, this is, it won't actually convert an instance to a refererence snapshot,
+ * but just fool typescript into thinking so.
+ *
+ * Example:
+ * ```ts
+ * const ModelA = types.model({
+ *   id: types.identifier,
+ *   n: types.number
+ * }).actions(self => ({
+ *   setN(aNumber: number) {
+ *     self.n = aNumber
+ *   }
+ * }))
+ *
+ * const ModelB = types.model({
+ *   refA: types.reference(ModelA)
+ * })
+ *
+ * const a = ModelA.create({ id: 'someId', n: 5 });
+ * // this will allow the compiler to use a model as if it were a reference snapshot
+ * const b = ModelB.create({ refA: castToReference(a)})
+ * ```
+ *
+ * @param instance Instance
+ * @returns The same object casted as an reference snapshot (string or number)
+ */
+export function castToReferenceSnapshot<I>(
+    instance: I
+): Extract<I, IAnyStateTreeNode> extends never ? I : ReferenceIdentifier {
+    return instance as any
+}
+
+/**
+ * Returns the unique node id (not to be confused with the instance identifier) for a
+ * given instance.
+ * This id is a number that is unique for each instance.
+ *
+ * @export
+ * @param target
+ * @returns
+ */
+export function getNodeId(target: IAnyStateTreeNode): number {
+    assertIsStateTreeNode(target, 1)
+
+    return getStateTreeNode(target).nodeId
+}

@@ -1,6 +1,19 @@
 import { IMiddlewareEvent, IMiddlewareHandler } from "../internal"
 
+const runningActions = new Map<number, { async: boolean; call: IMiddlewareEvent; context: any }>()
+
+export interface IActionTrackingMiddlewareHooks<T> {
+    filter?: (call: IMiddlewareEvent) => boolean
+    onStart: (call: IMiddlewareEvent) => T
+    onResume: (call: IMiddlewareEvent, context: T) => void
+    onSuspend: (call: IMiddlewareEvent, context: T) => void
+    onSuccess: (call: IMiddlewareEvent, context: T, result: any) => void
+    onFail: (call: IMiddlewareEvent, context: T, error: any) => void
+}
+
 /**
+ * Note: Consider migrating to `createActionTrackingMiddleware2`, it is easier to use.
+ *
  * Convenience utility to create action based middleware that supports async processes more easily.
  * All hooks are called for both synchronous and asynchronous actions. Except that either `onSuccess` or `onFail` is called
  *
@@ -9,32 +22,16 @@ import { IMiddlewareEvent, IMiddlewareHandler } from "../internal"
  *
  * See the `atomic` middleware for an example
  *
- * @export
- * @template T
- * @template any
- * @param {{
- *     filter?: (call: IMiddlewareEvent) => boolean
- *     onStart: (call: IMiddlewareEvent) => T
- *     onResume: (call: IMiddlewareEvent, context: T) => void
- *     onSuspend: (call: IMiddlewareEvent, context: T) => void
- *     onSuccess: (call: IMiddlewareEvent, context: T, result: any) => void
- *     onFail: (call: IMiddlewareEvent, context: T, error: any) => void
- * }} hooks
- * @returns {IMiddlewareHandler}
+ * @param hooks
+ * @returns
  */
-export function createActionTrackingMiddleware<T = any>(hooks: {
-    filter?: (call: IMiddlewareEvent) => boolean
-    onStart: (call: IMiddlewareEvent) => T
-    onResume: (call: IMiddlewareEvent, context: T) => void
-    onSuspend: (call: IMiddlewareEvent, context: T) => void
-    onSuccess: (call: IMiddlewareEvent, context: T, result: any) => void
-    onFail: (call: IMiddlewareEvent, context: T, error: any) => void
-}): IMiddlewareHandler {
-    const runningActions = new Map<number, { async: boolean; call: IMiddlewareEvent; context: T }>()
-
+export function createActionTrackingMiddleware<T = any>(
+    hooks: IActionTrackingMiddlewareHooks<T>
+): IMiddlewareHandler {
     return function actionTrackingMiddleware(
         call: IMiddlewareEvent,
-        next: (actionCall: IMiddlewareEvent) => any
+        next: (actionCall: IMiddlewareEvent) => any,
+        abort: (value: any) => any
     ) {
         switch (call.type) {
             case "action": {
@@ -50,10 +47,12 @@ export function createActionTrackingMiddleware<T = any>(hooks: {
                         const res = next(call)
                         hooks.onSuspend(call, context)
                         if (runningActions.get(call.id)!.async === false) {
+                            runningActions.delete(call.id)
                             hooks.onSuccess(call, context, res)
                         }
                         return res
                     } catch (e) {
+                        runningActions.delete(call.id)
                         hooks.onFail(call, context, e)
                         throw e
                     }
@@ -78,13 +77,13 @@ export function createActionTrackingMiddleware<T = any>(hooks: {
             }
             case "flow_throw": {
                 const root = runningActions.get(call.rootId)!
-                runningActions.delete(call.id)
+                runningActions.delete(call.rootId)
                 hooks.onFail(call, root.context, call.args[0])
                 return next(call)
             }
             case "flow_return": {
                 const root = runningActions.get(call.rootId)!
-                runningActions.delete(call.id)
+                runningActions.delete(call.rootId)
                 hooks.onSuccess(call, root.context, call.args[0])
                 return next(call)
             }

@@ -1,42 +1,25 @@
-import filesize from "rollup-plugin-filesize"
-import resolve from "rollup-plugin-node-resolve"
-import uglify from "rollup-plugin-uglify"
-import replace from "rollup-plugin-replace"
+import { baseConfig } from "../../rollup.base-config"
 
-function getEnvVariables(production) {
-    return { "process.env.NODE_ENV": production ? "'production'" : "'development'" }
-}
+const config = (outFile, format, mode) =>
+    baseConfig({
+        outFile,
+        format,
+        mode,
+
+        input: "./lib/index.js",
+        globals: {
+            mobx: "mobx"
+        },
+        umdName: "mobxStateTree",
+        external: ["mobx"]
+    })
 
 export default [
-    {
-        entry: "./lib/index.js",
-        dest: "./dist/mobx-state-tree.js",
-        format: "cjs",
-        external: ["mobx"],
-        globals: {
-            mobx: "mobx"
-        },
-        plugins: [resolve(), filesize()]
-    },
-    {
-        entry: "./lib/index.js",
-        dest: "./dist/mobx-state-tree.umd.js",
-        format: "umd",
-        moduleName: "mobxStateTree",
-        external: ["mobx"],
-        globals: {
-            mobx: "mobx"
-        },
-        plugins: [resolve(), replace(getEnvVariables(true)), uglify(), filesize()]
-    },
-    {
-        entry: "./lib/index.js",
-        dest: "./dist/mobx-state-tree.module.js",
-        format: "es",
-        external: ["mobx"],
-        globals: {
-            mobx: "mobx"
-        },
-        plugins: [resolve(), filesize()]
-    }
+    config("mobx-state-tree.js", "cjs", "development"),
+    config("mobx-state-tree.min.js", "cjs", "production"),
+
+    config("mobx-state-tree.umd.js", "umd", "development"),
+    config("mobx-state-tree.umd.min.js", "umd", "production"),
+
+    config("mobx-state-tree.module.js", "es", "development")
 ]

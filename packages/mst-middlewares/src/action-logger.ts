@@ -1,6 +1,6 @@
-import { getPath, IMiddlewareEvent } from "mobx-state-tree"
+import { IMiddlewareEvent, getPath } from "mobx-state-tree"
 
-export function actionLogger(call: IMiddlewareEvent, next: any) {
+export function actionLogger(call: IMiddlewareEvent, next: (call: IMiddlewareEvent) => void) {
     const skip =
         (call.type === "action" && call.parentId !== 0) ||
         call.type === "flow_resume" ||
@@ -8,5 +8,5 @@ export function actionLogger(call: IMiddlewareEvent, next: any) {
 
     if (!skip)
         console.log(`[MST] #${call.rootId} ${call.type} - ${getPath(call.context)}/${call.name}`)
-    return next(call)
+    next(call)
 }

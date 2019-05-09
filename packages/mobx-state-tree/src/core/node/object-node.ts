@@ -1,415 +1,727 @@
-import { reaction, observable, computed } from "mobx"
+// noinspection ES6UnusedImports
+import { action, computed, reaction, _allowStateChangesInsideComputed } from "mobx"
 import {
-    INode,
-    isStateTreeNode,
-    getStateTreeNode,
+    addHiddenFinalProp,
+    ComplexType,
+    convertChildNodesToArray,
+    createActionInvoker,
+    EMPTY_OBJECT,
+    extend,
+    fail,
+    freeze,
+    IAnyType,
+    IdentifierCache,
+    IDisposer,
     IJsonPatch,
+    IMiddleware,
+    IMiddlewareHandler,
+    invalidateComputed,
     IReversibleJsonPatch,
+    NodeLifeCycle,
+    resolveNodeByPathParts,
     splitJsonPath,
     splitPatch,
-    IType,
-    IDisposer,
-    extend,
-    noop,
-    fail,
-    registerEventHandler,
-    addReadOnlyProp,
-    walk,
-    IMiddlewareHandler,
-    createActionInvoker,
-    NodeLifeCycle,
-    IdentifierCache,
-    EMPTY_ARRAY,
-    escapeJsonPath,
-    addHiddenFinalProp,
     toJSON,
-    joinJsonPath,
-    freeze,
+    EventHandlers,
+    Hook,
+    BaseNode,
+    getLivelinessChecking,
+    normalizeIdentifier,
+    ReferenceIdentifier,
+    IMiddlewareEvent,
+    escapeJsonPath,
+    getPath,
+    warnError,
+    AnyNode,
     IStateTreeNode,
-    resolvePath,
-    resolveNodeByPathParts
+    ArgumentTypes,
+    IType,
+    devMode,
+    getCurrentActionContext
 } from "../../internal"
 
 let nextNodeId = 1
 
-export class ObjectNode implements INode {
-    nodeId = ++nextNodeId
-    readonly type: IType<any, any>
-    readonly storedValue: any
-    @observable subpath: string = ""
-    @observable protected _parent: ObjectNode | null = null
-    _isRunningAction = false // only relevant for root
+const enum ObservableInstanceLifecycle {
+    // the actual observable instance has not been created yet
+    UNINITIALIZED,
+    // the actual observable instance is being created
+    CREATING,
+    // the actual observable instance has been created
+    CREATED
+}
 
-    identifierCache: IdentifierCache | undefined
+const enum InternalEvents {
+    Dispose = "dispose",
+    Patch = "patch",
+    Snapshot = "snapshot"
+}
+
+/**
+ * @internal
+ * @hidden
+ */
+export interface IChildNodesMap {
+    [key: string]: AnyNode
+}
+
+const snapshotReactionOptions = {
+    onError(e: any) {
+        throw e
+    }
+}
+
+type InternalEventHandlers<S> = {
+    [InternalEvents.Dispose]: IDisposer
+    [InternalEvents.Patch]: (patch: IJsonPatch, reversePatch: IJsonPatch) => void
+    [InternalEvents.Snapshot]: (snapshot: S) => void
+}
+
+/**
+ * @internal
+ * @hidden
+ */
+export class ObjectNode<C, S, T> extends BaseNode<C, S, T> {
+    readonly type!: ComplexType<C, S, T>
+    storedValue!: T & IStateTreeNode<IType<C, S, T>>
+
+    readonly nodeId = ++nextNodeId
+    readonly identifierAttribute?: string
+    readonly identifier: string | null // Identifier is always normalized to string, even if the identifier property isn't
+    readonly unnormalizedIdentifier: ReferenceIdentifier | null
+
+    identifierCache?: IdentifierCache
     isProtectionEnabled = true
-    identifierAttribute: string | undefined = undefined // not to be modified directly, only through model initialization
-    _environment: any = undefined
-    protected _autoUnbox = true // unboxing is disabled when reading child nodes
-    state = NodeLifeCycle.INITIALIZING
+    middlewares?: IMiddleware[]
 
-    middlewares = EMPTY_ARRAY as IMiddlewareHandler[]
-    private snapshotSubscribers: ((snapshot: any) => void)[]
-    private patchSubscribers: ((patch: IJsonPatch, reversePatch: IJsonPatch) => void)[]
-    private disposers: (() => void)[]
+    private _applyPatches?: (patches: IJsonPatch[]) => void
 
-    applyPatches: (patches: IJsonPatch[]) => void
+    applyPatches(patches: IJsonPatch[]): void {
+        this.createObservableInstanceIfNeeded()
+        this._applyPatches!(patches)
+    }
 
-    applySnapshot: (snapshot: any) => void
+    private _applySnapshot?: (snapshot: C) => void
+
+    applySnapshot(snapshot: C): void {
+        this.createObservableInstanceIfNeeded()
+        this._applySnapshot!(snapshot)
+    }
+
+    private _autoUnbox = true // unboxing is disabled when reading child nodes
+    _isRunningAction = false // only relevant for root
+    private _hasSnapshotReaction = false
+
+    private _observableInstanceState = ObservableInstanceLifecycle.UNINITIALIZED
+    private _childNodes: IChildNodesMap
+    private _initialSnapshot: C
+    private _cachedInitialSnapshot?: S
+    private _cachedInitialSnapshotCreated = false
 
     constructor(
-        type: IType<any, any>,
-        parent: ObjectNode | null,
+        complexType: ComplexType<C, S, T>,
+        parent: AnyObjectNode | null,
         subpath: string,
         environment: any,
-        initialValue: any,
-        storedValue: any,
-        canAttachTreeNode: boolean,
-        finalizeNewInstance: (node: INode, initialValue: any) => void = noop
+        initialValue: C
     ) {
-        this.type = type
-        this.storedValue = storedValue
-        this._parent = parent
-        this.subpath = subpath
-        this._environment = environment
+        super(complexType, parent, subpath, environment)
+
         this.unbox = this.unbox.bind(this)
 
-        this.preboot()
+        this._initialSnapshot = freeze(initialValue)
+        this.identifierAttribute = complexType.identifierAttribute
 
-        if (!parent) this.identifierCache = new IdentifierCache()
-        if (canAttachTreeNode) addHiddenFinalProp(this.storedValue, "$treenode", this)
-
-        let sawException = true
-        try {
-            if (canAttachTreeNode) addHiddenFinalProp(this.storedValue, "toJSON", toJSON)
-
-            this._isRunningAction = true
-            finalizeNewInstance(this, initialValue)
-            this._isRunningAction = false
-
-            if (parent) parent.root.identifierCache!.addNodeToCache(this)
-            else this.identifierCache!.addNodeToCache(this)
-
-            this.fireHook("afterCreate")
-            this.state = NodeLifeCycle.CREATED
-            sawException = false
-        } finally {
-            if (sawException) {
-                // short-cut to die the instance, to avoid the snapshot computed starting to throw...
-                this.state = NodeLifeCycle.DEAD
-            }
+        if (!parent) {
+            this.identifierCache = new IdentifierCache()
         }
 
-        const snapshotDisposer = reaction(
-            () => this.snapshot,
-            snapshot => {
-                this.emitSnapshot(snapshot)
+        this._childNodes = complexType.initializeChildNodes(this, this._initialSnapshot)
+
+        // identifier can not be changed during lifecycle of a node
+        // so we safely can read it from initial snapshot
+        this.identifier = null
+        this.unnormalizedIdentifier = null
+        if (this.identifierAttribute && this._initialSnapshot) {
+            let id = (this._initialSnapshot as any)[this.identifierAttribute]
+            if (id === undefined) {
+                // try with the actual node if not (for optional identifiers)
+                const childNode = this._childNodes[this.identifierAttribute]
+                if (childNode) {
+                    id = childNode.value
+                }
             }
-        )
-        snapshotDisposer.onError((e: any) => {
-            throw e
-        })
-        this.addDisposer(snapshotDisposer)
-    }
 
-    /*
-     * Returnes (escaped) path representation as string
-     */
-    @computed
-    public get path(): string {
-        if (!this.parent) return ""
-        return this.parent.path + "/" + escapeJsonPath(this.subpath)
-    }
-
-    public get isRoot(): boolean {
-        return this.parent === null
-    }
-
-    public get parent(): ObjectNode | null {
-        return this._parent
-    }
-
-    // Optimization: make computed
-    public get root(): ObjectNode {
-        let p,
-            r: ObjectNode = this
-        while ((p = r.parent)) r = p
-        return r
-    }
-
-    setParent(newParent: ObjectNode | null, subpath: string | null = null) {
-        if (this.parent === newParent && this.subpath === subpath) return
-        if (newParent) {
-            if (this._parent && newParent !== this._parent) {
-                fail(
-                    `A node cannot exists twice in the state tree. Failed to add ${this} to path '${newParent.path}/${subpath}'.`
+            if (typeof id !== "string" && typeof id !== "number") {
+                throw fail(
+                    `Instance identifier '${this.identifierAttribute}' for type '${
+                        this.type.name
+                    }' must be a string or a number`
                 )
             }
-            if (!this._parent && newParent.root === this) {
-                fail(
-                    `A state tree is not allowed to contain itself. Cannot assign ${this} to path '${newParent.path}/${subpath}'`
+
+            // normalize internal identifier to string
+            this.identifier = normalizeIdentifier(id)
+            this.unnormalizedIdentifier = id
+        }
+
+        if (!parent) {
+            this.identifierCache!.addNodeToCache(this)
+        } else {
+            parent.root.identifierCache!.addNodeToCache(this)
+        }
+    }
+
+    @action
+    createObservableInstanceIfNeeded(): void {
+        if (this._observableInstanceState !== ObservableInstanceLifecycle.UNINITIALIZED) {
+            return
+        }
+        if (devMode()) {
+            if (this.state !== NodeLifeCycle.INITIALIZING) {
+                // istanbul ignore next
+                throw fail(
+                    "assertion failed: the creation of the observable instance must be done on the initializing phase"
+                )
+            }
+        }
+        this._observableInstanceState = ObservableInstanceLifecycle.CREATING
+
+        // make sure the parent chain is created as well
+
+        // array with parent chain from parent to child
+        const parentChain = []
+
+        let parent = this.parent
+        // for performance reasons we never go back further than the most direct
+        // uninitialized parent
+        // this is done to avoid traversing the whole tree to the root when using
+        // the same reference again
+        while (
+            parent &&
+            parent._observableInstanceState === ObservableInstanceLifecycle.UNINITIALIZED
+        ) {
+            parentChain.unshift(parent)
+            parent = parent.parent
+        }
+
+        // initialize the uninitialized parent chain from parent to child
+        for (const p of parentChain) {
+            p.createObservableInstanceIfNeeded()
+        }
+
+        const type = this.type
+
+        try {
+            this.storedValue = type.createNewInstance(this._childNodes)
+            this.preboot()
+
+            this._isRunningAction = true
+            type.finalizeNewInstance(this, this.storedValue)
+        } catch (e) {
+            // short-cut to die the instance, to avoid the snapshot computed starting to throw...
+            this.state = NodeLifeCycle.DEAD
+            throw e
+        } finally {
+            this._isRunningAction = false
+        }
+
+        this._observableInstanceState = ObservableInstanceLifecycle.CREATED
+
+        // NOTE: we need to touch snapshot, because non-observable
+        // "_observableInstanceState" field was touched
+        invalidateComputed(this, "snapshot")
+
+        if (this.isRoot) this._addSnapshotReaction()
+
+        this._childNodes = EMPTY_OBJECT
+
+        this.state = NodeLifeCycle.CREATED
+        this.fireHook(Hook.afterCreate)
+
+        this.finalizeCreation()
+    }
+
+    get root(): AnyObjectNode {
+        const parent = this.parent
+        return parent ? parent.root : this
+    }
+
+    clearParent(): void {
+        if (!this.parent) return
+
+        // detach if attached
+        this.fireHook(Hook.beforeDetach)
+        const previousState = this.state
+        this.state = NodeLifeCycle.DETACHING
+
+        const root = this.root
+        const newEnv = root.environment
+        const newIdCache = root.identifierCache!.splitCache(this)
+
+        try {
+            this.parent.removeChild(this.subpath)
+            this.baseSetParent(null, "")
+            this.environment = newEnv
+            this.identifierCache = newIdCache
+        } finally {
+            this.state = previousState
+        }
+    }
+
+    setParent(newParent: AnyObjectNode, subpath: string): void {
+        const parentChanged = newParent !== this.parent
+        const subpathChanged = subpath !== this.subpath
+
+        if (!parentChanged && !subpathChanged) {
+            return
+        }
+
+        if (devMode()) {
+            if (!subpath) {
+                // istanbul ignore next
+                throw fail("assertion failed: subpath expected")
+            }
+            if (!newParent) {
+                // istanbul ignore next
+                throw fail("assertion failed: new parent expected")
+            }
+
+            if (this.parent && parentChanged) {
+                throw fail(
+                    `A node cannot exists twice in the state tree. Failed to add ${this} to path '${
+                        newParent.path
+                    }/${subpath}'.`
+                )
+            }
+            if (!this.parent && newParent.root === this) {
+                throw fail(
+                    `A state tree is not allowed to contain itself. Cannot assign ${this} to path '${
+                        newParent.path
+                    }/${subpath}'`
                 )
             }
             if (
-                !this._parent &&
-                !!this.root._environment &&
-                this.root._environment !== newParent.root._environment
+                !this.parent &&
+                !!this.environment &&
+                this.environment !== newParent.root.environment
             ) {
-                fail(
+                throw fail(
                     `A state tree cannot be made part of another state tree as long as their environments are different.`
                 )
             }
         }
-        if (this.parent && !newParent) {
-            this.die()
-        } else {
-            this.subpath = subpath || ""
-            if (newParent && newParent !== this._parent) {
-                newParent.root.identifierCache!.mergeCache(this)
-                this._parent = newParent
-                this.fireHook("afterAttach")
+
+        if (parentChanged) {
+            // attach to new parent
+            this.environment = undefined // will use root's
+            newParent.root.identifierCache!.mergeCache(this)
+            this.baseSetParent(newParent, subpath)
+            this.fireHook(Hook.afterAttach)
+        } else if (subpathChanged) {
+            // moving to a new subpath on the same parent
+            this.baseSetParent(this.parent, subpath)
+        }
+    }
+
+    protected fireHook(name: Hook): void {
+        this.fireInternalHook(name)
+
+        const fn =
+            this.storedValue &&
+            typeof this.storedValue === "object" &&
+            (this.storedValue as any)[name]
+        if (typeof fn === "function") {
+            // we check for it to allow old mobx peer dependencies that don't have the method to work (even when still bugged)
+            if (_allowStateChangesInsideComputed) {
+                _allowStateChangesInsideComputed(() => {
+                    fn.apply(this.storedValue)
+                })
+            } else {
+                fn.apply(this.storedValue)
             }
         }
     }
 
-    fireHook(name: string) {
-        const fn =
-            this.storedValue && typeof this.storedValue === "object" && this.storedValue[name]
-        if (typeof fn === "function") fn.apply(this.storedValue)
+    private _snapshotUponDeath?: S
+
+    // advantage of using computed for a snapshot is that nicely respects transactions etc.
+    @computed
+    get snapshot(): S {
+        return freeze(this.getSnapshot())
     }
 
-    @computed
-    public get value(): any {
-        if (!this.isAlive) return undefined
-        return this.type.getValue(this)
+    // NOTE: we use this method to get snapshot without creating @computed overhead
+    getSnapshot(): S {
+        if (!this.isAlive) return this._snapshotUponDeath!
+        return this._observableInstanceState === ObservableInstanceLifecycle.CREATED
+            ? this._getActualSnapshot()
+            : this._getCachedInitialSnapshot()
     }
 
-    @computed
-    public get snapshot() {
-        if (!this.isAlive) return undefined
-        // advantage of using computed for a snapshot is that nicely respects transactions etc.
-        const snapshot = this.type.getSnapshot(this)
-        // avoid any external modification in dev mode
-        if (process.env.NODE_ENV !== "production") {
-            return freeze(snapshot)
+    private _getActualSnapshot(): S {
+        return this.type.getSnapshot(this)
+    }
+
+    private _getCachedInitialSnapshot(): S {
+        if (!this._cachedInitialSnapshotCreated) {
+            const type = this.type
+            const childNodes = this._childNodes
+            const snapshot = this._initialSnapshot
+
+            this._cachedInitialSnapshot = type.processInitialSnapshot(childNodes, snapshot)
+            this._cachedInitialSnapshotCreated = true
         }
-        return snapshot
+
+        return this._cachedInitialSnapshot!
     }
 
-    isRunningAction(): boolean {
+    private isRunningAction(): boolean {
         if (this._isRunningAction) return true
         if (this.isRoot) return false
         return this.parent!.isRunningAction()
     }
 
-    get identifier(): string | null {
-        return this.identifierAttribute ? this.storedValue[this.identifierAttribute] : null
+    assertAlive(context: AssertAliveContext): void {
+        const livelinessChecking = getLivelinessChecking()
+        if (!this.isAlive && livelinessChecking !== "ignore") {
+            const error = this._getAssertAliveError(context)
+            switch (livelinessChecking) {
+                case "error":
+                    throw fail(error)
+                case "warn":
+                    warnError(error)
+            }
+        }
     }
 
-    public get isAlive() {
-        return this.state !== NodeLifeCycle.DEAD
+    private _getAssertAliveError(context: AssertAliveContext): string {
+        const escapedPath = this.getEscapedPath(false) || this.pathUponDeath || ""
+        const subpath = (context.subpath && escapeJsonPath(context.subpath)) || ""
+
+        let actionContext = context.actionContext || getCurrentActionContext()
+
+        // try to use a real action context if possible since it includes the action name
+        if (actionContext && actionContext.type !== "action" && actionContext.parentActionEvent) {
+            actionContext = actionContext.parentActionEvent
+        }
+
+        let actionFullPath = ""
+        if (actionContext && actionContext.name != null) {
+            // try to use the context, and if it not available use the node one
+            const actionPath =
+                (actionContext && actionContext.context && getPath(actionContext.context)) ||
+                escapedPath
+            actionFullPath = `${actionPath}.${actionContext.name}()`
+        }
+
+        return `You are trying to read or write to an object that is no longer part of a state tree. (Object type: '${
+            this.type.name
+        }', Path upon death: '${escapedPath}', Subpath: '${subpath}', Action: '${actionFullPath}'). Either detach nodes first, or don't use objects after removing / replacing them in the tree.`
     }
 
-    public assertAlive() {
-        if (!this.isAlive)
-            fail(
-                `${this} cannot be used anymore as it has died; it has been removed from a state tree. If you want to remove an element from a tree and let it live on, use 'detach' or 'clone' the value`
-            )
-    }
-
-    getChildNode(subpath: string): INode {
-        this.assertAlive()
+    getChildNode(subpath: string): AnyNode {
+        this.assertAlive({
+            subpath
+        })
         this._autoUnbox = false
-        const res = this.type.getChildNode(this, subpath)
-        this._autoUnbox = true
-        return res
+        try {
+            return this._observableInstanceState === ObservableInstanceLifecycle.CREATED
+                ? this.type.getChildNode(this, subpath)
+                : this._childNodes![subpath]
+        } finally {
+            this._autoUnbox = true
+        }
     }
 
-    getChildren(): INode[] {
-        this.assertAlive()
+    getChildren(): ReadonlyArray<AnyNode> {
+        this.assertAlive(EMPTY_OBJECT)
         this._autoUnbox = false
-        const res = this.type.getChildren(this)
-        this._autoUnbox = true
-        return res
+        try {
+            return this._observableInstanceState === ObservableInstanceLifecycle.CREATED
+                ? this.type.getChildren(this)
+                : convertChildNodesToArray(this._childNodes)
+        } finally {
+            this._autoUnbox = true
+        }
     }
 
-    getChildType(key: string): IType<any, any> {
-        return this.type.getChildType(key)
+    getChildType(propertyName?: string): IAnyType {
+        return this.type.getChildType(propertyName)
     }
 
     get isProtected(): boolean {
         return this.root.isProtectionEnabled
     }
 
-    assertWritable() {
-        this.assertAlive()
+    assertWritable(context: AssertAliveContext): void {
+        this.assertAlive(context)
         if (!this.isRunningAction() && this.isProtected) {
-            fail(
+            throw fail(
                 `Cannot modify '${this}', the object is protected and can only be modified by using an action.`
             )
         }
     }
 
-    removeChild(subpath: string) {
+    removeChild(subpath: string): void {
         this.type.removeChild(this, subpath)
     }
 
-    unbox(childNode: INode): any {
-        if (childNode && this._autoUnbox === true) return childNode.value
-        return childNode
+    // bound on the constructor
+    unbox(childNode: AnyNode | undefined): AnyNode | undefined {
+        if (!childNode) return childNode
+
+        this.assertAlive({
+            subpath: childNode.subpath || childNode.subpathUponDeath
+        })
+        return this._autoUnbox ? childNode.value : childNode
     }
 
     toString(): string {
+        const path = (this.isAlive ? this.path : this.pathUponDeath) || "<root>"
         const identifier = this.identifier ? `(id: ${this.identifier})` : ""
-        return `${this.type.name}@${this.path || "<root>"}${identifier}${this.isAlive
-            ? ""
-            : "[dead]"}`
+        return `${this.type.name}@${path}${identifier}${this.isAlive ? "" : " [dead]"}`
     }
 
-    finalizeCreation() {
-        // goal: afterCreate hooks runs depth-first. After attach runs parent first, so on afterAttach the parent has completed already
-        if (this.state === NodeLifeCycle.CREATED) {
-            if (this.parent) {
-                if (this.parent.state !== NodeLifeCycle.FINALIZED) {
-                    // parent not ready yet, postpone
-                    return
-                }
-                this.fireHook("afterAttach")
-            }
-            this.state = NodeLifeCycle.FINALIZED
+    finalizeCreation(): void {
+        this.baseFinalizeCreation(() => {
             for (let child of this.getChildren()) {
-                if (child instanceof ObjectNode) child.finalizeCreation()
+                child.finalizeCreation()
             }
-        }
+
+            this.fireInternalHook(Hook.afterCreationFinalization)
+        })
     }
 
-    detach() {
-        if (!this.isAlive) fail(`Error while detaching, node is not alive.`)
-        if (this.isRoot) return
-        else {
-            this.fireHook("beforeDetach")
-            this._environment = this.root._environment // make backup of environment
-            this.state = NodeLifeCycle.DETACHING
-            this.identifierCache = this.root.identifierCache!.splitCache(this)
-            this.parent!.removeChild(this.subpath)
-            this._parent = null
-            this.subpath = ""
-            this.state = NodeLifeCycle.FINALIZED
-        }
+    @action
+    detach(): void {
+        if (!this.isAlive) throw fail(`Error while detaching, node is not alive.`)
+
+        this.clearParent()
     }
 
-    preboot() {
-        this.disposers = []
-        this.middlewares = []
-        this.snapshotSubscribers = []
-        this.patchSubscribers = []
-
-        // Optimization: this does not need to be done per instance
-        // if some pieces from createActionInvoker are extracted
-        this.applyPatches = createActionInvoker(
+    private preboot(): void {
+        const self = this
+        this._applyPatches = createActionInvoker(
             this.storedValue,
             "@APPLY_PATCHES",
             (patches: IJsonPatch[]) => {
                 patches.forEach(patch => {
                     const parts = splitJsonPath(patch.path)
-                    const node = resolveNodeByPathParts(this, parts.slice(0, -1))
-                    ;(node as ObjectNode).applyPatchLocally(parts[parts.length - 1], patch)
+                    const node = resolveNodeByPathParts(self, parts.slice(0, -1)) as AnyObjectNode
+                    node.applyPatchLocally(parts[parts.length - 1], patch)
                 })
             }
-        ).bind(this.storedValue)
-        this.applySnapshot = createActionInvoker(
+        )
+        this._applySnapshot = createActionInvoker(
             this.storedValue,
             "@APPLY_SNAPSHOT",
-            (snapshot: any) => {
+            (snapshot: C) => {
                 // if the snapshot is the same as the current one, avoid performing a reconcile
-                if (snapshot === this.snapshot) return
+                if (snapshot === (self.snapshot as any)) return
                 // else, apply it by calling the type logic
-                return this.type.applySnapshot(this, snapshot)
+                return self.type.applySnapshot(self, snapshot as any)
             }
-        ).bind(this.storedValue)
+        )
+
+        addHiddenFinalProp(this.storedValue, "$treenode", this)
+        addHiddenFinalProp(this.storedValue, "toJSON", toJSON)
     }
 
-    public die() {
-        if (this.state === NodeLifeCycle.DETACHING) return
+    @action
+    die(): void {
+        if (!this.isAlive || this.state === NodeLifeCycle.DETACHING) return
+        this.aboutToDie()
+        this.finalizeDeath()
+    }
 
-        if (isStateTreeNode(this.storedValue)) {
-            // optimization: don't use walk, but getChildNodes for more efficiency
-            walk(this.storedValue, child => {
-                const node = getStateTreeNode(child)
-                if (node instanceof ObjectNode) node.aboutToDie()
-            })
-            walk(this.storedValue, child => {
-                const node = getStateTreeNode(child)
-                if (node instanceof ObjectNode) node.finalizeDeath()
-            })
+    aboutToDie(): void {
+        if (this._observableInstanceState === ObservableInstanceLifecycle.UNINITIALIZED) {
+            return
         }
-    }
 
-    public aboutToDie() {
-        this.disposers.splice(0).forEach(f => f())
-        this.fireHook("beforeDestroy")
-    }
-
-    public finalizeDeath() {
-        // invariant: not called directly but from "die"
-        this.root.identifierCache!.notifyDied(this)
-        const self = this
-        const oldPath = this.path
-        addReadOnlyProp(this, "snapshot", this.snapshot) // kill the computed prop and just store the last snapshot
-
-        this.patchSubscribers.splice(0)
-        this.snapshotSubscribers.splice(0)
-        this.patchSubscribers.splice(0)
-        this.state = NodeLifeCycle.DEAD
-        this._parent = null
-        this.subpath = ""
-
-        // This is quite a hack, once interceptable objects / arrays / maps are extracted from mobx,
-        // we could express this in a much nicer way
-        // TODO: should be possible to obtain id's still...
-        Object.defineProperty(this.storedValue, "$mobx", {
-            get() {
-                fail(
-                    `This object has died and is no longer part of a state tree. It cannot be used anymore. The object (of type '${self
-                        .type
-                        .name}') used to live at '${oldPath}'. It is possible to access the last snapshot of this object using 'getSnapshot', or to create a fresh copy using 'clone'. If you want to remove an object from the tree without killing it, use 'detach' instead.`
-                )
-            }
+        this.getChildren().forEach(node => {
+            node.aboutToDie()
         })
+
+        // beforeDestroy should run before the disposers since else we could end up in a situation where
+        // a disposer added with addDisposer at this stage (beforeDestroy) is actually never released
+        this.baseAboutToDie()
+
+        this._internalEventsEmit(InternalEvents.Dispose)
+        this._internalEventsClear(InternalEvents.Dispose)
     }
 
-    public onSnapshot(onChange: (snapshot: any) => void): IDisposer {
-        return registerEventHandler(this.snapshotSubscribers, onChange)
+    finalizeDeath(): void {
+        // invariant: not called directly but from "die"
+        this.getChildren().forEach(node => {
+            node.finalizeDeath()
+        })
+        this.root.identifierCache!.notifyDied(this)
+
+        // "kill" the computed prop and just store the last snapshot
+        const snapshot = this.snapshot
+        this._snapshotUponDeath = snapshot
+
+        this._internalEventsClearAll()
+
+        this.baseFinalizeDeath()
     }
 
-    public emitSnapshot(snapshot: any) {
-        this.snapshotSubscribers.forEach((f: Function) => f(snapshot))
+    onSnapshot(onChange: (snapshot: S) => void): IDisposer {
+        this._addSnapshotReaction()
+        return this._internalEventsRegister(InternalEvents.Snapshot, onChange)
     }
 
-    public onPatch(handler: (patch: IJsonPatch, reversePatch: IJsonPatch) => void): IDisposer {
-        return registerEventHandler(this.patchSubscribers, handler)
+    protected emitSnapshot(snapshot: S): void {
+        this._internalEventsEmit(InternalEvents.Snapshot, snapshot)
     }
 
-    emitPatch(basePatch: IReversibleJsonPatch, source: INode) {
-        if (this.patchSubscribers.length) {
+    onPatch(handler: (patch: IJsonPatch, reversePatch: IJsonPatch) => void): IDisposer {
+        return this._internalEventsRegister(InternalEvents.Patch, handler)
+    }
+
+    emitPatch(basePatch: IReversibleJsonPatch, source: AnyNode): void {
+        if (this._internalEventsHasSubscribers(InternalEvents.Patch)) {
             const localizedPatch: IReversibleJsonPatch = extend({}, basePatch, {
                 path: source.path.substr(this.path.length) + "/" + basePatch.path // calculate the relative path of the patch
             })
             const [patch, reversePatch] = splitPatch(localizedPatch)
-            this.patchSubscribers.forEach(f => f(patch, reversePatch))
+            this._internalEventsEmit(InternalEvents.Patch, patch, reversePatch)
         }
         if (this.parent) this.parent.emitPatch(basePatch, source)
     }
 
-    addDisposer(disposer: () => void) {
-        this.disposers.unshift(disposer)
+    hasDisposer(disposer: () => void): boolean {
+        return this._internalEventsHas(InternalEvents.Dispose, disposer)
     }
 
-    addMiddleWare(handler: IMiddlewareHandler) {
-        return registerEventHandler(this.middlewares, handler)
+    addDisposer(disposer: () => void): void {
+        if (!this.hasDisposer(disposer)) {
+            this._internalEventsRegister(InternalEvents.Dispose, disposer, true)
+            return
+        }
+        throw fail("cannot add a disposer when it is already registered for execution")
+    }
+
+    removeDisposer(disposer: () => void): void {
+        if (!this._internalEventsHas(InternalEvents.Dispose, disposer)) {
+            throw fail("cannot remove a disposer which was never registered for execution")
+        }
+        this._internalEventsUnregister(InternalEvents.Dispose, disposer)
+    }
+
+    private removeMiddleware(middleware: IMiddleware): void {
+        if (this.middlewares) {
+            const index = this.middlewares.indexOf(middleware)
+            if (index >= 0) {
+                this.middlewares.splice(index, 1)
+            }
+        }
+    }
+
+    addMiddleWare(handler: IMiddlewareHandler, includeHooks: boolean = true): IDisposer {
+        const middleware = { handler, includeHooks }
+        if (!this.middlewares) this.middlewares = [middleware]
+        else this.middlewares.push(middleware)
+
+        return () => {
+            this.removeMiddleware(middleware)
+        }
     }
 
     applyPatchLocally(subpath: string, patch: IJsonPatch): void {
-        this.assertWritable()
+        this.assertWritable({
+            subpath
+        })
+        this.createObservableInstanceIfNeeded()
         this.type.applyPatchLocally(this, subpath, patch)
     }
+
+    private _addSnapshotReaction(): void {
+        if (!this._hasSnapshotReaction) {
+            const snapshotDisposer = reaction(
+                () => this.snapshot,
+                snapshot => this.emitSnapshot(snapshot),
+                snapshotReactionOptions
+            )
+            this.addDisposer(snapshotDisposer)
+            this._hasSnapshotReaction = true
+        }
+    }
+
+    // #region internal event handling
+
+    private _internalEvents?: EventHandlers<InternalEventHandlers<S>>
+
+    // we proxy the methods to avoid creating an EventHandlers instance when it is not needed
+
+    private _internalEventsHasSubscribers(event: InternalEvents): boolean {
+        return !!this._internalEvents && this._internalEvents.hasSubscribers(event)
+    }
+
+    private _internalEventsRegister<IE extends InternalEvents>(
+        event: IE,
+        eventHandler: InternalEventHandlers<S>[IE],
+        atTheBeginning = false
+    ): IDisposer {
+        if (!this._internalEvents) {
+            this._internalEvents = new EventHandlers()
+        }
+        return this._internalEvents.register(event, eventHandler, atTheBeginning)
+    }
+
+    private _internalEventsHas<IE extends InternalEvents>(
+        event: IE,
+        eventHandler: InternalEventHandlers<S>[IE]
+    ): boolean {
+        return !!this._internalEvents && this._internalEvents.has(event, eventHandler)
+    }
+
+    private _internalEventsUnregister<IE extends InternalEvents>(
+        event: IE,
+        eventHandler: InternalEventHandlers<S>[IE]
+    ): void {
+        if (this._internalEvents) {
+            this._internalEvents.unregister(event, eventHandler)
+        }
+    }
+
+    private _internalEventsEmit<IE extends InternalEvents>(
+        event: IE,
+        ...args: ArgumentTypes<InternalEventHandlers<S>[IE]>
+    ): void {
+        if (this._internalEvents) {
+            this._internalEvents.emit(event, ...args)
+        }
+    }
+
+    private _internalEventsClear(event: InternalEvents): void {
+        if (this._internalEvents) {
+            this._internalEvents.clear(event)
+        }
+    }
+
+    private _internalEventsClearAll(): void {
+        if (this._internalEvents) {
+            this._internalEvents.clearAll()
+        }
+    }
+
+    // #endregion
+}
+
+/**
+ * @internal
+ * @hidden
+ */
+export type AnyObjectNode = ObjectNode<any, any, any>
+
+/**
+ * @internal
+ * @hidden
+ */
+export interface AssertAliveContext {
+    subpath?: string
+    actionContext?: IMiddlewareEvent
 }

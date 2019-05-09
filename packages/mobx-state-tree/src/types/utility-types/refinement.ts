@@ -1,106 +1,107 @@
 import {
     isStateTreeNode,
     getStateTreeNode,
-    INode,
-    IType,
-    Type,
-    IContext,
+    IValidationContext,
     IValidationResult,
     typeCheckSuccess,
     typeCheckFailure,
     isType,
     fail,
-    TypeFlags
+    TypeFlags,
+    IAnyType,
+    AnyObjectNode,
+    BaseType,
+    ExtractNodeType,
+    assertIsType,
+    devMode
 } from "../../internal"
+import { assertIsString, assertIsFunction } from "../../utils"
 
-export class Refinement<S, T> extends Type<S, T> {
-    readonly type: IType<any, any>
-    readonly predicate: (v: any) => boolean
-    readonly message: (v: any) => string
-
+class Refinement<IT extends IAnyType> extends BaseType<
+    IT["CreationType"],
+    IT["SnapshotType"],
+    IT["TypeWithoutSTN"],
+    ExtractNodeType<IT>
+> {
     get flags() {
-        return this.type.flags | TypeFlags.Refinement
-    }
-
-    get shouldAttachNode() {
-        return this.type.shouldAttachNode
+        return this._subtype.flags | TypeFlags.Refinement
     }
 
     constructor(
         name: string,
-        type: IType<any, any>,
-        predicate: (v: any) => boolean,
-        message: (v: any) => string
+        private readonly _subtype: IT,
+        private readonly _predicate: (v: IT["CreationType"]) => boolean,
+        private readonly _message: (v: IT["CreationType"]) => string
     ) {
         super(name)
-        this.type = type
-        this.predicate = predicate
-        this.message = message
     }
 
     describe() {
         return this.name
     }
 
-    instantiate(parent: INode, subpath: string, environment: any, value: any): INode {
+    instantiate(
+        parent: AnyObjectNode | null,
+        subpath: string,
+        environment: any,
+        initialValue: this["C"] | this["T"]
+    ): this["N"] {
         // create the child type
-        const inst = this.type.instantiate(parent, subpath, environment, value)
-
-        return inst
+        return this._subtype.instantiate(parent, subpath, environment, initialValue)
     }
 
-    isAssignableFrom(type: IType<any, any>) {
-        return this.type.isAssignableFrom(type)
+    isAssignableFrom(type: IAnyType) {
+        return this._subtype.isAssignableFrom(type)
     }
 
-    isValidSnapshot(value: any, context: IContext): IValidationResult {
-        const subtypeErrors = this.type.validate(value, context)
+    isValidSnapshot(value: this["C"], context: IValidationContext): IValidationResult {
+        const subtypeErrors = this._subtype.validate(value, context)
         if (subtypeErrors.length > 0) return subtypeErrors
 
         const snapshot = isStateTreeNode(value) ? getStateTreeNode(value).snapshot : value
 
-        if (!this.predicate(snapshot)) {
-            return typeCheckFailure(context, value, this.message(value))
+        if (!this._predicate(snapshot)) {
+            return typeCheckFailure(context, value, this._message(value))
         }
 
         return typeCheckSuccess()
     }
+
+    reconcile(
+        current: this["N"],
+        newValue: this["C"] | this["T"],
+        parent: AnyObjectNode,
+        subpath: string
+    ): this["N"] {
+        return this._subtype.reconcile(current, newValue, parent, subpath)
+    }
+
+    getSubTypes() {
+        return this._subtype
+    }
 }
 
-export function refinement<T>(
+export function refinement<IT extends IAnyType>(
     name: string,
-    type: IType<T, T>,
-    predicate: (snapshot: T) => boolean,
-    message?: string | ((v: any) => string)
-): IType<T, T>
-export function refinement<S, T extends S, U extends S>(
-    name: string,
-    type: IType<S, T>,
-    predicate: (snapshot: S) => snapshot is U,
-    message?: string | ((v: any) => string)
-): IType<S, U>
-export function refinement<S, T extends S, U extends S>(
-    type: IType<S, T>,
-    predicate: (snapshot: S) => snapshot is U,
-    message?: string | ((v: any) => string)
-): IType<S, U>
-export function refinement<T>(
-    type: IType<T, T>,
-    predicate: (snapshot: T) => boolean,
-    message?: string | ((v: any) => string)
-): IType<T, T>
+    type: IT,
+    predicate: (snapshot: IT["CreationType"]) => boolean,
+    message?: string | ((v: IT["CreationType"]) => string)
+): IT
+export function refinement<IT extends IAnyType>(
+    type: IT,
+    predicate: (snapshot: IT["CreationType"]) => boolean,
+    message?: string | ((v: IT["CreationType"]) => string)
+): IT
+
 /**
- * `types.refinement(baseType, (snapshot) => boolean)` creates a type that is more specific than the base type, e.g. `types.refinement(types.string, value => value.length > 5)` to create a type of strings that can only be longer then 5.
+ * `types.refinement` - Creates a type that is more specific than the base type, e.g. `types.refinement(types.string, value => value.length > 5)` to create a type of strings that can only be longer then 5.
  *
- * @export
- * @alias types.refinement
- * @template T
- * @param {string} name
- * @param {IType<T, T>} type
- * @param {(snapshot: T) => boolean} predicate
- * @returns {IType<T, T>}
+ * @param name
+ * @param type
+ * @param predicate
+ * @returns
  */
-export function refinement(...args: any[]): IType<any, any> {
+export function refinement(...args: any[]): IAnyType {
     const name = typeof args[0] === "string" ? args.shift() : isType(args[0]) ? args[0].name : null
     const type = args[0]
     const predicate = args[1]
@@ -108,23 +109,20 @@ export function refinement(...args: any[]): IType<any, any> {
         ? args[2]
         : (v: any) => "Value does not respect the refinement predicate"
     // ensures all parameters are correct
-    if (process.env.NODE_ENV !== "production") {
-        if (typeof name !== "string")
-            fail("expected a string as first argument, got " + name + " instead")
-        if (!isType(type))
-            fail(
-                "expected a mobx-state-tree type as first or second argument, got " +
-                    type +
-                    " instead"
-            )
-        if (typeof predicate !== "function")
-            fail("expected a function as third argument, got " + predicate + " instead")
-        if (typeof message !== "function")
-            fail("expected a function as fourth argument, got " + message + " instead")
-    }
+    assertIsType(type, [1, 2])
+    assertIsString(name, 1)
+    assertIsFunction(predicate, [2, 3])
+    assertIsFunction(message, [3, 4])
+
     return new Refinement(name, type, predicate, message)
 }
 
-export function isRefinementType(type: any): type is Refinement<any, any> {
+/**
+ * Returns if a given value is a refinement type.
+ *
+ * @param type
+ * @returns
+ */
+export function isRefinementType<IT extends IAnyType>(type: IT): type is IT {
     return (type.flags & TypeFlags.Refinement) > 0
 }

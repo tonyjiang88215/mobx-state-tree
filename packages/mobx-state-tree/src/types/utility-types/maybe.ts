@@ -1,26 +1,48 @@
-import { union, nullType, optional, IType, isType, frozen, fail } from "../../internal"
+import {
+    union,
+    optional,
+    IType,
+    undefinedType,
+    nullType,
+    IAnyType,
+    assertIsType
+} from "../../internal"
 
+const optionalUndefinedType = optional(undefinedType, undefined)
 const optionalNullType = optional(nullType, null)
 
+/** @hidden */
+export interface IMaybeIType<IT extends IAnyType, C, O>
+    extends IType<IT["CreationType"] | C, IT["SnapshotType"] | O, IT["TypeWithoutSTN"] | O> {}
+
+/** @hidden */
+export interface IMaybe<IT extends IAnyType> extends IMaybeIType<IT, undefined, undefined> {}
+
+/** @hidden */
+export interface IMaybeNull<IT extends IAnyType> extends IMaybeIType<IT, null | undefined, null> {}
+
 /**
- * Maybe will make a type nullable, and also null by default.
+ * `types.maybe` - Maybe will make a type nullable, and also optional.
+ * The value `undefined` will be used to represent nullability.
  *
- * @export
- * @alias types.maybe
- * @template S
- * @template T
- * @param {IType<S, T>} type The type to make nullable
- * @returns {(IType<S | null | undefined, T | null>)}
+ * @param type
+ * @returns
  */
-export function maybe<S, T>(type: IType<S, T>): IType<S | null | undefined, T | null> {
-    if (process.env.NODE_ENV !== "production") {
-        if (!isType(type))
-            fail("expected a mobx-state-tree type as first argument, got " + type + " instead")
-        if (type === frozen) {
-            fail(
-                "Unable to declare `types.maybe(types.frozen)`. Frozen already accepts `null`. Consider using `types.optional(types.frozen, null)` instead."
-            )
-        }
-    }
-    return union(optionalNullType, type)
+export function maybe<IT extends IAnyType>(type: IT): IMaybe<IT> {
+    assertIsType(type, 1)
+
+    return union(type, optionalUndefinedType)
+}
+
+/**
+ * `types.maybeNull` - Maybe will make a type nullable, and also optional.
+ * The value `null` will be used to represent no value.
+ *
+ * @param type
+ * @returns
+ */
+export function maybeNull<IT extends IAnyType>(type: IT): IMaybeNull<IT> {
+    assertIsType(type, 1)
+
+    return union(type, optionalNullType)
 }

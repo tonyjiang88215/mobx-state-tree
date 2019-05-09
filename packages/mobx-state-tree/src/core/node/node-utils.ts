@@ -1,5 +1,22 @@
-import { IType, fail, ObjectNode, splitJsonPath, joinJsonPath } from "../../internal"
+import {
+    fail,
+    ObjectNode,
+    splitJsonPath,
+    joinJsonPath,
+    ScalarNode,
+    IChildNodesMap,
+    EMPTY_ARRAY,
+    AnyObjectNode,
+    AnyNode,
+    IAnyType,
+    IType,
+    assertArg
+} from "../../internal"
 
+/**
+ * @internal
+ * @hidden
+ */
 export enum NodeLifeCycle {
     INITIALIZING, // setting up
     CREATED, // afterCreate has run
@@ -8,68 +25,101 @@ export enum NodeLifeCycle {
     DEAD // no coming back from this one
 }
 
-export interface INode {
-    readonly type: IType<any, any>
-    readonly storedValue: any
-    readonly path: string
-    readonly isRoot: boolean
-    readonly parent: ObjectNode | null
-    readonly root: ObjectNode
-    readonly _environment: any
-    subpath: string
+/** @hidden */
+declare const $stateTreeNodeType: unique symbol
 
-    isAlive: boolean
-    readonly value: any
-    readonly snapshot: any
-
-    setParent(newParent: ObjectNode | null, subpath?: string | null): void
-    die(): void
-}
-
-export type IStateTreeNode = {
+/**
+ * Common interface that represents a node instance.
+ * @hidden
+ */
+export interface IStateTreeNode<IT extends IAnyType = IAnyType> {
+    /**
+     * @internal
+     */
     readonly $treenode?: any
+
+    // fake, will never be present, just for typing
+    // we use this weird trick to solve an issue with reference types
+    readonly [$stateTreeNodeType]?: [IT] | [any]
 }
+
+/** @hidden */
+export type TypeOfValue<T extends IAnyStateTreeNode> = T extends IStateTreeNode<infer IT>
+    ? IT
+    : never
+
+/**
+ * Represents any state tree node instance.
+ * @hidden
+ */
+export interface IAnyStateTreeNode extends IStateTreeNode<IAnyType> {}
 
 /**
  * Returns true if the given value is a node in a state tree.
  * More precisely, that is, if the value is an instance of a
  * `types.model`, `types.array` or `types.map`.
  *
- * @export
- * @param {*} value
- * @returns {value is IStateTreeNode}
+ * @param value
+ * @returns true if the value is a state tree node.
  */
-export function isStateTreeNode(value: any): value is IStateTreeNode {
+export function isStateTreeNode<IT extends IAnyType = IAnyType>(
+    value: any
+): value is IStateTreeNode<IT> {
     return !!(value && value.$treenode)
 }
 
-export function getStateTreeNode(value: IStateTreeNode): ObjectNode {
-    if (isStateTreeNode(value)) return value.$treenode!
-    else return fail(`Value ${value} is no MST Node`)
+/**
+ * @internal
+ * @hidden
+ */
+export function assertIsStateTreeNode(
+    value: IAnyStateTreeNode,
+    argNumber: number | number[]
+): void {
+    assertArg(value, isStateTreeNode, "mobx-state-tree node", argNumber)
 }
 
-export function canAttachNode(value: any) {
-    return (
-        value &&
-        typeof value === "object" &&
-        !(value instanceof Date) &&
-        !isStateTreeNode(value) &&
-        !Object.isFrozen(value)
-    )
+/**
+ * @internal
+ * @hidden
+ */
+export function getStateTreeNode(value: IAnyStateTreeNode): AnyObjectNode {
+    if (!isStateTreeNode(value)) {
+        // istanbul ignore next
+        throw fail(`Value ${value} is no MST Node`)
+    }
+    return value.$treenode!
 }
 
-export function toJSON(this: IStateTreeNode) {
+/**
+ * @internal
+ * @hidden
+ */
+export function getStateTreeNodeSafe(value: IAnyStateTreeNode): AnyObjectNode | null {
+    return (value && value.$treenode) || null
+}
+
+/**
+ * @internal
+ * @hidden
+ */
+export function toJSON<S>(this: IStateTreeNode<IType<any, S, any>>): S {
     return getStateTreeNode(this).snapshot
 }
 
 const doubleDot = (_: any) => ".."
 
-export function getRelativePathBetweenNodes(base: ObjectNode, target: ObjectNode): string {
+/**
+ * @internal
+ * @hidden
+ */
+export function getRelativePathBetweenNodes(base: AnyObjectNode, target: AnyObjectNode): string {
     // PRE condition target is (a child of) base!
-    if (base.root !== target.root)
-        fail(
+    if (base.root !== target.root) {
+        throw fail(
             `Cannot calculate relative path: objects '${base}' and '${target}' are not part of the same object tree`
         )
+    }
 
     const baseParts = splitJsonPath(base.path)
     const targetParts = splitJsonPath(target.path)
@@ -86,57 +136,84 @@ export function getRelativePathBetweenNodes(base: ObjectNode, target: ObjectNode
     )
 }
 
-export function resolveNodeByPath(base: ObjectNode, pathParts: string): INode
+/**
+ * @internal
+ * @hidden
+ */
 export function resolveNodeByPath(
-    base: ObjectNode,
-    pathParts: string,
-    failIfResolveFails: boolean
-): INode | undefined
-export function resolveNodeByPath(
-    base: ObjectNode,
+    base: AnyObjectNode,
     path: string,
     failIfResolveFails: boolean = true
-): INode | undefined {
+): AnyNode | undefined {
     return resolveNodeByPathParts(base, splitJsonPath(path), failIfResolveFails)
 }
 
-export function resolveNodeByPathParts(base: ObjectNode, pathParts: string[]): INode
+/**
+ * @internal
+ * @hidden
+ */
 export function resolveNodeByPathParts(
-    base: ObjectNode,
-    pathParts: string[],
-    failIfResolveFails: boolean
-): INode | undefined
-export function resolveNodeByPathParts(
-    base: ObjectNode,
+    base: AnyObjectNode,
     pathParts: string[],
     failIfResolveFails: boolean = true
-): INode | undefined {
-    // counter part of getRelativePath
-    // note that `../` is not part of the JSON pointer spec, which is actually a prefix format
-    // in json pointer: "" = current, "/a", attribute a, "/" is attribute "" etc...
-    // so we treat leading ../ apart...
-    let current: INode | null = base
-    for (let i = 0; i < pathParts.length; i++) {
-        if (pathParts[i] === "") current = current!.root
-        else if (pathParts[i] === "..") current = current!.parent
-        else if (pathParts[i] === "." || pathParts[i] === "")
-            // '/bla' or 'a//b' splits to empty strings
-            continue
-        else if (current) {
-            if (current instanceof ObjectNode) current = current.getChildNode(pathParts[i])
-            else return fail(`Illegal state`)
-            continue
-        }
+): AnyNode | undefined {
+    let current: AnyNode | null = base
 
-        if (!current) {
-            if (failIfResolveFails)
-                return fail(
-                    `Could not resolve '${pathParts[i]}' in '${joinJsonPath(
-                        pathParts.slice(0, i - 1)
-                    )}', path of the patch does not resolve`
-                )
-            else return undefined
+    for (let i = 0; i < pathParts.length; i++) {
+        const part = pathParts[i]
+        if (part === "..") {
+            current = current!.parent
+            if (current) continue // not everything has a parent
+        } else if (part === ".") {
+            continue
+        } else if (current) {
+            if (current instanceof ScalarNode) {
+                // check if the value of a scalar resolves to a state tree node (e.g. references)
+                // then we can continue resolving...
+                try {
+                    const value: any = current.value
+                    if (isStateTreeNode(value)) {
+                        current = getStateTreeNode(value)
+                        // fall through
+                    }
+                } catch (e) {
+                    if (!failIfResolveFails) {
+                        return undefined
+                    }
+                    throw e
+                }
+            }
+            if (current instanceof ObjectNode) {
+                const subType = current.getChildType(part)
+                if (subType) {
+                    current = current.getChildNode(part)
+                    if (current) continue
+                }
+            }
         }
+        if (failIfResolveFails)
+            throw fail(
+                `Could not resolve '${part}' in path '${joinJsonPath(pathParts.slice(0, i)) ||
+                    "/"}' while resolving '${joinJsonPath(pathParts)}'`
+            )
+        else return undefined
     }
     return current!
+}
+
+/**
+ * @internal
+ * @hidden
+ */
+export function convertChildNodesToArray(childNodes: IChildNodesMap | null): AnyNode[] {
+    if (!childNodes) return EMPTY_ARRAY as AnyNode[]
+
+    const keys = Object.keys(childNodes)
+    if (!keys.length) return EMPTY_ARRAY as AnyNode[]
+
+    const result = new Array(keys.length) as AnyNode[]
+    keys.forEach((key, index) => {
+        result[index] = childNodes![key]
+    })
+    return result
 }

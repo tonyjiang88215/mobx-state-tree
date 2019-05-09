@@ -1,38 +1,48 @@
 import {
     fail,
     isPrimitive,
-    INode,
-    createNode,
+    createScalarNode,
     ISimpleType,
-    Type,
     TypeFlags,
-    IContext,
+    IValidationContext,
     IValidationResult,
     typeCheckSuccess,
     typeCheckFailure,
     isType,
-    ObjectNode
+    Primitives,
+    AnyObjectNode,
+    SimpleType,
+    devMode
 } from "../../internal"
+import { assertArg } from "../../utils"
 
-export class Literal<T> extends Type<T, T> {
-    readonly shouldAttachNode = false
-    readonly value: any
+/**
+ * @internal
+ * @hidden
+ */
+export class Literal<T> extends SimpleType<T, T, T> {
+    readonly value: T
     readonly flags = TypeFlags.Literal
 
-    constructor(value: any) {
+    constructor(value: T) {
         super(JSON.stringify(value))
         this.value = value
     }
 
-    instantiate(parent: ObjectNode | null, subpath: string, environment: any, snapshot: T): INode {
-        return createNode(this, parent, subpath, environment, snapshot)
+    instantiate(
+        parent: AnyObjectNode | null,
+        subpath: string,
+        environment: any,
+        initialValue: this["C"]
+    ): this["N"] {
+        return createScalarNode(this, parent, subpath, environment, initialValue)
     }
 
     describe() {
         return JSON.stringify(this.value)
     }
 
-    isValidSnapshot(value: any, context: IContext): IValidationResult {
+    isValidSnapshot(value: this["C"], context: IValidationContext): IValidationResult {
         if (isPrimitive(value) && value === this.value) {
             return typeCheckSuccess()
         }
@@ -45,30 +55,34 @@ export class Literal<T> extends Type<T, T> {
 }
 
 /**
- * The literal type will return a type that will match only the exact given type.
+ * `types.literal` - The literal type will return a type that will match only the exact given type.
  * The given value must be a primitive, in order to be serialized to a snapshot correctly.
  * You can use literal to match exact strings for example the exact male or female string.
  *
- * @example
+ * Example:
+ * ```ts
  * const Person = types.model({
  *     name: types.string,
  *     gender: types.union(types.literal('male'), types.literal('female'))
  * })
+ * ```
  *
- * @export
- * @alias types.literal
- * @template S
- * @param {S} value The value to use in the strict equal check
- * @returns {ISimpleType<S>}
+ * @param value The value to use in the strict equal check
+ * @returns
  */
-export function literal<S>(value: S): ISimpleType<S> {
+export function literal<S extends Primitives>(value: S): ISimpleType<S> {
     // check that the given value is a primitive
-    if (process.env.NODE_ENV !== "production") {
-        if (!isPrimitive(value)) fail(`Literal types can be built only on top of primitives`)
-    }
+    assertArg(value, isPrimitive, "primitive", 1)
+
     return new Literal<S>(value)
 }
 
-export function isLiteralType(type: any): type is Literal<any> {
+/**
+ * Returns if a given value represents a literal type.
+ *
+ * @param type
+ * @returns
+ */
+export function isLiteralType<IT extends ISimpleType<any>>(type: IT): type is IT {
     return isType(type) && (type.flags & TypeFlags.Literal) > 0
 }

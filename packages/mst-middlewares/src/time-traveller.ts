@@ -1,19 +1,17 @@
 import {
     types,
-    onSnapshot,
-    applySnapshot,
-    getSnapshot,
-    getEnv,
     resolvePath,
-    getPath,
-    ISnapshottable,
-    IModelType
+    getEnv,
+    onSnapshot,
+    getSnapshot,
+    applySnapshot,
+    IDisposer
 } from "mobx-state-tree"
 import { IObservableArray } from "mobx"
 
 const TimeTraveller = types
     .model("TimeTraveller", {
-        history: types.optional(types.array(types.frozen), []),
+        history: types.array(types.frozen()),
         undoIdx: -1,
         targetPath: ""
     })
@@ -27,7 +25,7 @@ const TimeTraveller = types
     }))
     .actions(self => {
         let targetStore: any
-        let snapshotDisposer: any
+        let snapshotDisposer: IDisposer
         let skipNextUndoState = false
 
         return {
@@ -47,16 +45,16 @@ const TimeTraveller = types
                     : getEnv(self).targetStore
                 if (!targetStore)
                     throw new Error(
-                        "Failed to find target store for TimeTraveller. Please provide `targetPath`  property, or a `targetStore` in the environment"
+                        "Failed to find target store for TimeTraveller. Please provide `targetPath` property, or a `targetStore` in the environment"
                     )
                 // TODO: check if targetStore doesn't contain self
                 // if (contains(targetStore, self)) throw new Error("TimeTraveller shouldn't be recording itself. Please specify a sibling as taret, not some parent")
                 // start listening to changes
-                snapshotDisposer = onSnapshot(targetStore, snapshot =>
-                    (self as any).addUndoState(snapshot)
-                )
+                snapshotDisposer = onSnapshot(targetStore, snapshot => this.addUndoState(snapshot))
                 // record an initial state if no known
-                if (self.history.length === 0) (self as any).addUndoState(getSnapshot(targetStore))
+                if (self.history.length === 0) {
+                    this.addUndoState(getSnapshot(targetStore))
+                }
             },
             beforeDestroy() {
                 snapshotDisposer()

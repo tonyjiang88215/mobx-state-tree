@@ -1,25 +1,7 @@
 {
-    "version": "2.0.0",
+    "extends": "../../tsconfig.base.json",
     "compilerOptions": {
-        "target": "es5",
-        "sourceMap": true,
-        "declaration": true,
-        "module": "es2015",
-        "removeComments": false,
-        "outDir": "lib/",
-        "noImplicitAny": true,
-        "moduleResolution": "node",
-        "experimentalDecorators": true,
-        "strictNullChecks": true,
-        "noFallthroughCasesInSwitch": true,
-        "noImplicitReturns": true,
-        "noImplicitThis": true,
-        "importHelpers": true,
-        "lib": [
-            "dom", "es2015", "scripthost", "es2015.promise", "es2015.generator", "es2015.iterable"
-        ]
+        "outDir": "lib/"
     },
-    "files": [
-        "src/index.ts"
-    ]
+    "files": ["src/index.ts"]
 }

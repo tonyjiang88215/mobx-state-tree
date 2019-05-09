@@ -1,67 +1,98 @@
-// based on: https://github.com/mobxjs/mobx-utils/blob/master/src/async-action.ts
+/** @hidden */
+declare const $flowYield: unique symbol
 
-export function flow<R>(generator: () => IterableIterator<any>): () => Promise<R>
-export function flow<A1>(generator: (a1: A1) => IterableIterator<any>): (a1: A1) => Promise<any> // Ideally we want to have R instead of Any, but cannot specify R without specifying A1 etc... 'any' as result is better then not specifying request args
-export function flow<A1, A2>(
-    generator: (a1: A1, a2: A2) => IterableIterator<any>
-): (a1: A1, a2: A2) => Promise<any>
-export function flow<A1, A2, A3>(
-    generator: (a1: A1, a2: A2, a3: A3) => IterableIterator<any>
-): (a1: A1, a2: A2, a3: A3) => Promise<any>
-export function flow<A1, A2, A3, A4>(
-    generator: (a1: A1, a2: A2, a3: A3, a4: A4) => IterableIterator<any>
-): (a1: A1, a2: A2, a3: A3, a4: A4) => Promise<any>
-export function flow<A1, A2, A3, A4, A5>(
-    generator: (a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => IterableIterator<any>
-): (a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => Promise<any>
-export function flow<A1, A2, A3, A4, A5, A6>(
-    generator: (a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6) => IterableIterator<any>
-): (a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6) => Promise<any>
-export function flow<A1, A2, A3, A4, A5, A6, A7>(
-    generator: (a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6, a7: A7) => IterableIterator<any>
-): (a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6, a7: A7) => Promise<any>
-export function flow<A1, A2, A3, A4, A5, A6, A7, A8>(
-    generator: (
-        a1: A1,
-        a2: A2,
-        a3: A3,
-        a4: A4,
-        a5: A5,
-        a6: A6,
-        a7: A7,
-        a8: A8
-    ) => IterableIterator<any>
-): (a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6, a7: A7, a8: A8) => Promise<any>
+/** @hidden */
+export interface FlowYield {
+    // fake, only for typing
+    [$flowYield]: undefined
+}
+
+/** @hidden */
+declare const $flowReturn: unique symbol
+
+/** @hidden */
+export interface FlowReturn<T> {
+    // fake, only for typing
+    [$flowReturn]: T
+}
+
+// we skip promises that are the result of yielding promises (except if they use flowReturn)
+/** @hidden */
+export type FlowReturnType<R> = IfAllAreFlowYieldThenVoid<
+    R extends FlowReturn<infer FR>
+        ? FR extends Promise<infer FRP>
+            ? FRP
+            : FR
+        : R extends Promise<any>
+        ? FlowYield
+        : R
+>
+
+// we extract yielded promises from the return type
+/** @hidden */
+export type IfAllAreFlowYieldThenVoid<R> = Exclude<R, FlowYield> extends never
+    ? void
+    : Exclude<R, FlowYield>
+
 /**
  * See [asynchronous actions](https://github.com/mobxjs/mobx-state-tree/blob/master/docs/async-actions.md).
  *
- * @export
- * @alias flow
- * @returns {Promise}
+ * @returns The flow as a promise.
  */
-export function flow(asyncAction: any): any {
-    return createFlowSpawner(asyncAction.name, asyncAction)
+export function flow<R, Args extends any[]>(
+    generator: (...args: Args) => IterableIterator<R>
+): (...args: Args) => Promise<FlowReturnType<R>> {
+    return createFlowSpawner(generator.name, generator) as any
 }
 
+/**
+ *  Used for TypeScript to make flows that return a promise return the actual promise result.
+ *
+ * @param val
+ * @returns
+ */
+export function castFlowReturn<T>(val: T): FlowReturn<T> {
+    return val as any
+}
+
+/**
+ * @internal
+ * @hidden
+ */
 export function createFlowSpawner(name: string, generator: Function) {
     const spawner = function flowSpawner(this: any) {
         // Implementation based on https://github.com/tj/co/blob/master/index.js
         const runId = getNextActionId()
-        const baseContext = getActionContext()
+        const parentContext = getCurrentActionContext()!
+        if (!parentContext) {
+            throw fail("a mst flow must always have a parent context")
+        }
+        const parentActionContext = getParentActionContext(parentContext)
+        if (!parentActionContext) {
+            throw fail("a mst flow must always have a parent action context")
+        }
+
+        const contextBase = {
+            name,
+            id: runId,
+            tree: parentContext.tree,
+            context: parentContext.context,
+            parentId: parentContext.id,
+            allParentIds: [...parentContext.allParentIds, parentContext.id],
+            rootId: parentContext.rootId,
+            parentEvent: parentContext,
+            parentActionEvent: parentActionContext
+        }
+
         const args = arguments
 
         function wrap(fn: any, type: IMiddlewareEventType, arg: any) {
             fn.$mst_middleware = (spawner as any).$mst_middleware // pick up any middleware attached to the flow
             runWithActionContext(
                 {
-                    name,
+                    ...contextBase,
                     type,
-                    id: runId,
-                    args: [arg],
-                    tree: baseContext.tree,
-                    context: baseContext.context,
-                    parentId: baseContext.id,
-                    rootId: baseContext.rootId
+                    args: [arg]
                 },
                 fn
             )
@@ -77,14 +108,9 @@ export function createFlowSpawner(name: string, generator: Function) {
 
             runWithActionContext(
                 {
-                    name,
+                    ...contextBase,
                     type: "flow_spawn",
-                    id: runId,
-                    args: argsToArray(args),
-                    tree: baseContext.tree,
-                    context: baseContext.context,
-                    parentId: baseContext.id,
-                    rootId: baseContext.rootId
+                    args: argsToArray(args)
                 },
                 init
             )
@@ -129,8 +155,10 @@ export function createFlowSpawner(name: string, generator: Function) {
                     return
                 }
                 // TODO: support more type of values? See https://github.com/tj/co/blob/249bbdc72da24ae44076afd716349d2089b31c4c/index.js#L100
-                if (!ret.value || typeof ret.value.then !== "function")
-                    fail("Only promises can be yielded to `async`, got: " + ret)
+                if (!ret.value || typeof ret.value.then !== "function") {
+                    // istanbul ignore next
+                    throw fail("Only promises can be yielded to `async`, got: " + ret)
+                }
                 return ret.value.then(onFulfilled, onRejected)
             }
         })
@@ -141,7 +169,8 @@ export function createFlowSpawner(name: string, generator: Function) {
 import {
     IMiddlewareEventType,
     runWithActionContext,
-    getActionContext,
+    getCurrentActionContext,
+    getParentActionContext,
     getNextActionId
 } from "./action"
 import { fail, argsToArray } from "../utils"
